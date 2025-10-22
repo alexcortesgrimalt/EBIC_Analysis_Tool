@@ -250,7 +250,17 @@ class SEMTiffProcessor:
         Returns dict {(row, col): (row2, col2)}.
         """
         import numpy as np
-        from skimage.metrics import structural_similarity as ssim
+        # Prefer scikit-image SSIM if available, otherwise provide a lightweight fallback
+        try:
+            from skimage.metrics import structural_similarity as ssim
+        except Exception:
+            # Lightweight fallback implementation using normalized cross-correlation
+            def ssim(a, b, data_range=1.0, gaussian_weights=True, win_size=None, use_sample_covariance=False):
+                # Normalize
+                a = (a - a.mean()) / (a.std() + 1e-12)
+                b = (b - b.mean()) / (b.std() + 1e-12)
+                # return mean of elementwise product as similarity proxy
+                return float((a * b).mean())
 
         assert img1.ndim == 2 and img2.ndim == 2, "Images must be 2D arrays"
         assert img1.shape == img2.shape, "Images must have the same dimensions"

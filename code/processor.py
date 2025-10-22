@@ -1,5 +1,5 @@
 from pathlib import Path
-from tiff_io import SEMTiffProcessor
+from .tiff_io import SEMTiffProcessor
 
 class SEMTiffProcessorWrapper:
     def __init__(self):

@@ -24,10 +24,20 @@ class Metadata:
                     return float(val.text)
             return 0.0
 
+        # Helper to safely parse a possibly whitespace-wrapped text
+        def _safe_float(text, default):
+            try:
+                if text is None:
+                    text = default
+                return float(str(text).strip())
+            except Exception:
+                return float(default)
+
         return {
-            'PixelSizeX': float(desc.findtext('image:PixelSizeX', '1e-6', namespaces=ns)),
+            'PixelSizeX': _safe_float(desc.findtext('image:PixelSizeX', '1e-6', namespaces=ns), '1e-6'),
             'Contrast': get_nested_value('efa:Contrast'),
-            'EffectiveAmpGain': float(desc.findtext('efa:EffectiveAmpGain', '1e6', namespaces=ns)),
+            # EffectiveAmpGain is nested under rdf:value in many XMPs -> use helper
+            'EffectiveAmpGain': get_nested_value('efa:EffectiveAmpGain'),
             'OutputOffset': get_nested_value('efa:OutputOffset'),
             'InputOffset': get_nested_value('efa:InputOffset'),
             'InverseEnabled': bool(int(desc.findtext('efa:InverseEnabled', '0', namespaces=ns))),

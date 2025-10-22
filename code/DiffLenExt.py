@@ -387,9 +387,10 @@ class DiffusionLengthExtractor:
 
         # --- Remove padding ---
         filtered_y = filtered_padded[pad_width:pad_width + n]
-
-        # Restore mean
-        filtered_y += np.mean(y_vals)
+        # Restore mean exactly (compensate for numerical error)
+        orig_mean = np.mean(y_vals)
+        # filtered_y currently has zero-mean w.r.t. padded centered signal; adjust so mean matches original
+        filtered_y += (orig_mean - np.mean(filtered_y))
 
         # Optional: visualize
         if visualize:

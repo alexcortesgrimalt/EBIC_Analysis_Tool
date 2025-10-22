@@ -9,11 +9,11 @@ from matplotlib.widgets import Button
 import matplotlib.patches as patches
 from scipy.ndimage import map_coordinates
 from scipy.stats import pearsonr
-from Junction_Analyser import JunctionAnalyzer
-from perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles
-from helper_gui import fit_perpendicular_profiles
-from helper_gui import ask_junction_width, draw_scalebar, safe_remove_colorbar
-from ROI_extractor import extract_line_rectangle
+from .Junction_Analyser import JunctionAnalyzer
+from .perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles
+from .helper_gui import fit_perpendicular_profiles
+from .helper_gui import ask_junction_width, draw_scalebar, safe_remove_colorbar
+from .ROI_extractor import extract_line_rectangle
 
 # ==================== SEM VIEWER ====================
 class SEMViewer:

@@ -13,10 +13,10 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from scipy.ndimage import map_coordinates
 
-from DiffLenExt import DiffusionLengthExtractor
-from Junction_Analyser import JunctionAnalyzer
-from ROI_extractor import extract_line_rectangle
-from perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles
+from .DiffLenExt import DiffusionLengthExtractor
+from .Junction_Analyser import JunctionAnalyzer
+from .ROI_extractor import extract_line_rectangle
+from .perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles
 
 
 # ==================== Dialog Functions ====================

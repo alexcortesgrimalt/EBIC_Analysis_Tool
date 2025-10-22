@@ -1,8 +1,8 @@
 import os
 import re
 import glob
-from maps import PixelMap, CurrentMap
-from Metadata import Metadata
+from .maps import PixelMap, CurrentMap
+from .Metadata import Metadata
 import numpy as np
 
 class SEMTiffProcessor:

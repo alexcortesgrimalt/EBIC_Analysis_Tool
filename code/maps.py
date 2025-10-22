@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 import os
-from Metadata import Metadata
+from .Metadata import Metadata
 
 class PixelMap:
     def __init__(self, image, metadata: Metadata, output_dir):
