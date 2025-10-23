@@ -3,6 +3,28 @@ import os
 import tkinter as tk
 from tkinter import simpledialog
 import numpy as np
+import matplotlib
+
+# Try to verify that Tk is usable (can create a root). If not, switch to Agg backend
+# to avoid raising TclError in headless environments (CI/tests).
+_has_tk = False
+try:
+    # importing tkinter succeeded above; try creating / destroying a root
+    try:
+        _tmp_root = tk.Tk()
+        _tmp_root.destroy()
+        _has_tk = True
+    except Exception:
+        _has_tk = False
+except Exception:
+    _has_tk = False
+
+if not _has_tk:
+    try:
+        matplotlib.use('Agg')
+    except Exception:
+        pass
+
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.widgets import Button
@@ -12,7 +34,7 @@ from scipy.stats import pearsonr
 from .Junction_Analyser import JunctionAnalyzer
 from .perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles
 from .helper_gui import fit_perpendicular_profiles
-from .helper_gui import ask_junction_width, draw_scalebar, safe_remove_colorbar
+from .helper_gui import ask_junction_width, ask_junction_weight, draw_scalebar, safe_remove_colorbar
 from .ROI_extractor import extract_line_rectangle
 
 # ==================== SEM VIEWER ====================
@@ -23,6 +45,22 @@ class SEMViewer:
         self.current_maps = current_maps
         self.pixel_size = pixel_size
         self.sample_name = sample_name
+        # Backwards-compatibility/fallback: if processor didn't produce a separate
+        # current_map for frame 2 but the TIFF includes a raw second frame, use it
+        # as the current map so overlay and profile computations have data.
+        try:
+            if (self.current_maps is None or len(self.current_maps) <= 1 or self.current_maps[1] is None) and \
+               (self.pixel_maps is not None and len(self.pixel_maps) > 1 and self.pixel_maps[1] is not None):
+                # ensure list length
+                if self.current_maps is None:
+                    self.current_maps = [None] * (len(self.pixel_maps))
+                while len(self.current_maps) < 2:
+                    self.current_maps.append(None)
+                self.current_maps[1] = self.pixel_maps[1]
+                print(f"SEMViewer: no processed current_map for frame_2 — using raw frame_2 as fallback for '{self.sample_name}'")
+        except Exception:
+            # keep robust if inputs are unexpected
+            pass
         self.index = 0
         self.map_type = 'current'
         self.overlay_mode = False
@@ -206,12 +244,22 @@ class SEMViewer:
 
         try:
             if self.overlay_mode:
-                # Overlay mode implementation
+                # Overlay mode implementation with diagnostics
                 if len(self.pixel_maps) < 1 or len(self.current_maps) < 2:
+                    print(f"Overlay requested but not enough frames: pixel_maps={len(self.pixel_maps)}, current_maps={len(self.current_maps)}")
                     self.ax.set_title("Overlay: Not enough frames.")
                 else:
                     pixel = self.pixel_maps[0]
-                    current = self.current_maps[1]
+                    # Prefer the processed current map, but if it wasn't produced (None),
+                    # fall back to the raw second frame (pixel_maps[1]) which may already
+                    # contain EBIC values in some TIFF varieties.
+                    current = None
+                    if len(self.current_maps) > 1:
+                        current = self.current_maps[1]
+                    if current is None and len(self.pixel_maps) > 1:
+                        # fallback: use raw second frame as current map
+                        current = self.pixel_maps[1]
+                        print(f"Overlay fallback: using raw frame_2 (pixel_maps[1]) as current map for '{self.sample_name}'")
 
                     if pixel is not None:
                         self.im = self.ax.imshow(
@@ -222,6 +270,7 @@ class SEMViewer:
                             self.ax.set_xlim(0, pixel.shape[1])
                             self.ax.set_ylim(pixel.shape[0], 0)
 
+                    # If current is present, overlay it; otherwise warn and continue showing SEM
                     if current is not None and pixel is not None:
                         # Create colorbar axis if it doesn't exist
                         if self.cbar_ax is None or not self.cbar_ax in self.fig.axes:
@@ -235,6 +284,8 @@ class SEMViewer:
                         )
                         self.cbar = self.fig.colorbar(self.im, cax=self.cbar_ax)
                         self.cbar.set_label("Current (nA)")
+                    else:
+                        print(f"Overlay: current map missing for '{self.sample_name}' (current_maps[1] is None). Showing pixel map only.")
 
                     self.ax.set_title(f"{self.sample_name} - Overlay: Pixel Map + Current Map")
 
@@ -376,11 +427,29 @@ class SEMViewer:
                     roi, roi_coords = extract_line_rectangle(pixel_map,
                                                                   self.manual_line_dense,
                                                                   half_width_px)
+
+                    # Try to build EBIC/current ROI if available
+                    roi_current = None
+                    try:
+                        if self.current_maps is not None and len(self.current_maps) > 1 and self.current_maps[1] is not None:
+                            current_map = self.current_maps[1]
+                            roi_current, _ = extract_line_rectangle(current_map, self.manual_line_dense, half_width_px)
+                    except Exception:
+                        roi_current = None
+
+                    # Ask user for EBIC weight (1.0 by default)
+                    try:
+                        weight = ask_junction_weight()
+                        if weight is None:
+                            weight = 10.0
+                    except Exception:
+                        weight = 10.0
+                    print(f"Junction detection: using EBIC weight = {weight}")
+
                     analyzer = JunctionAnalyzer(pixel_size_m=self.pixel_size)
-                    results = analyzer.detect(roi, self.manual_line_dense)
+                    results = analyzer.detect(roi, self.manual_line_dense, roi_current=roi_current, weight_current=weight)
 
                     if results:
-                        # **New Code:**
                         # Get the best result (which is the only one returned by Canny)
                         best_result = results[0]
                         detected_coords = best_result[1]
@@ -620,7 +689,6 @@ class SEMViewer:
         if line_coords is None:
             line_coords = self.line_coords  # fallback
 
-        # Create dense line
         if isinstance(line_coords, np.ndarray) and line_coords.shape[1] == 2:
             x0, y0 = line_coords[0]
             x1, y1 = line_coords[-1]
@@ -835,8 +903,26 @@ class SEMViewer:
         # Create analyzer (Canny only)
         analyzer = JunctionAnalyzer(pixel_size_m=self.pixel_size)
 
+        # Try to build EBIC/current ROI if available
+        roi_current = None
+        try:
+            if self.current_maps is not None and len(self.current_maps) > 1 and self.current_maps[1] is not None:
+                current_map = self.current_maps[1]
+                roi_current, _ = extract_line_rectangle(current_map, self.manual_line_dense, half_width_px)
+        except Exception:
+            roi_current = None
+
+        # Ask user for EBIC weight
+        try:
+            weight = ask_junction_weight()
+            if weight is None:
+                weight = 10.0
+        except Exception:
+            weight = 10.0
+        print(f"Junction detection: using EBIC weight = {weight}")
+
         # Detect junction (returns a single result in a list)
-        results = analyzer.detect(roi, self.manual_line_dense)
+        results = analyzer.detect(roi, self.manual_line_dense, roi_current=roi_current, weight_current=weight)
 
         if not results:
             print("Junction detection failed.")

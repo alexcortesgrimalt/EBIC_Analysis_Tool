@@ -15,7 +15,6 @@ class DiffusionLengthExtractor:
     def load_profiles(self, profiles):
         self.profiles = profiles
 
-    # --- exponential models ---
     @staticmethod
     def exp_rising(x, A, lam, y0, x0):
         return A * np.exp(lam * (x - x0)) + y0
@@ -86,7 +85,13 @@ class DiffusionLengthExtractor:
                 maxfev=20000
             )
             fit_curve = self.exp_model(x, *popt)
-            inv_lambda = max(round((1.0 / popt[1]) / self.pixel_size) * self.pixel_size, self.pixel_size)
+            # x values passed to the fitter are in micrometers (dist_um). popt[1] (lam)
+            # therefore has units 1/µm. Compute inv_lambda in µm and quantize to
+            # the pixel grid given by pixel_size (stored in meters).
+            pixel_size_um = self.pixel_size * 1e6
+            inv_lambda_um = 1.0 / popt[1]
+            # Quantize to pixel grid (in µm) and enforce at least one pixel
+            inv_lambda = max(round(inv_lambda_um / pixel_size_um) * pixel_size_um, pixel_size_um)
             r2 = self._calculate_r2(y, fit_curve)
 
             if shift == 0:
@@ -530,21 +535,28 @@ class DiffusionLengthExtractor:
         ]
 
         # --- Diffusion lengths by side ---
-        left_lengths, right_lengths = [], []
+        left_lengths, right_lengths = np.array([], dtype=float), np.array([], dtype=float)
         for res in self.results:
             for side in res['fit_sides']:
                 if side.get('inv_lambda') is not None:
                     if "Left" in side['side']:
-                        left_lengths.append(side['inv_lambda'])
+                        left_lengths = np.append(left_lengths, side['inv_lambda'])
                     elif "Right" in side['side']:
-                        right_lengths.append(side['inv_lambda'])
+                        right_lengths = np.append(right_lengths, side['inv_lambda'])
 
         # Compute means
         avg_depletion = np.mean(depletion_widths) if depletion_widths else None
-        avg_left = np.mean(left_lengths) if left_lengths else None
-        avg_right = np.mean(right_lengths) if right_lengths else None
-        combined = left_lengths + right_lengths
-        avg_all = np.mean(combined) if combined else None
+        avg_left = np.mean(left_lengths) if left_lengths.any() else None
+        avg_right = np.mean(right_lengths) if right_lengths.any() else None
+        # Combine left and right inv_lambda arrays into a single vector.
+        # Use concatenation to avoid elementwise broadcasting for unequal lengths.
+        if left_lengths.size and right_lengths.size:
+            combined = np.concatenate([left_lengths, right_lengths])
+        elif left_lengths.size:
+            combined = left_lengths
+        else:
+            combined = right_lengths
+        avg_all = np.mean(combined) if combined.any() else None
 
         # --- Quantize values to pixel size ---
         def quantize(val):
@@ -575,7 +587,7 @@ class DiffusionLengthExtractor:
                 ["Depletion Width (µm)", f"{avg_depletion:.3f}" if avg_depletion else "N/A"],
                 ["Diffusion Length Left (µm)", f"{avg_left:.3f}" if avg_left else "N/A"],
                 ["Diffusion Length Right (µm)", f"{avg_right:.3f}" if avg_right else "N/A"],
-                ["Diffusion Length (All) (µm)", f"{avg_all:.3f}" if avg_all else "N/A"],
+                ["Diffusion Length (All average) (µm)", f"{avg_all:.3f}" if avg_all else "N/A"],
             ]
 
             table = ax.table(

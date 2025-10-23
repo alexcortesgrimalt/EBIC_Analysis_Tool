@@ -1,8 +1,8 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from pathlib import Path
-from sem_viewer import SEMViewer
-from processor import SEMTiffProcessorWrapper
+from .sem_viewer import SEMViewer
+from .processor import SEMTiffProcessorWrapper
 
 class SEMStarterGUI:
     def __init__(self):

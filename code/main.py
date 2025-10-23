@@ -1,5 +1,5 @@
-from gui import SEMStarterGUI
-from helper_gui import enable_windows_dpi_awareness
+from .gui import SEMStarterGUI
+from .helper_gui import enable_windows_dpi_awareness
 
 def main():
     enable_windows_dpi_awareness()

@@ -45,6 +45,30 @@ def ask_junction_width():
     return width_um
 
 
+def ask_junction_weight():
+    """
+    Show dialog to ask for EBIC weight to combine with SEM gradient.
+
+    Returns:
+        float: weight multiplier for EBIC gradients, or None if cancelled
+    """
+    root = tk.Tk()
+    root.withdraw()
+    root.update()
+    try:
+        weight = simpledialog.askfloat(
+            "EBIC Weight",
+            "Weight applied to EBIC/current gradient (0 = ignore EBIC, 10 advised):",
+            minvalue=0.0,
+            parent=root
+        )
+    except Exception:
+        weight = None
+    finally:
+        root.destroy()
+    return weight
+
+
 # ==================== Colorbar and Display Utilities ====================
 
 def safe_remove_colorbar(viewer):

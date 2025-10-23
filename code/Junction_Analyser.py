@@ -9,7 +9,7 @@ class JunctionAnalyzer:
     def __init__(self, pixel_size_m):
         self.pixel_size_m = pixel_size_m  # meters per pixel
 
-    def detect(self, roi, manual_line):
+    def detect(self, roi, manual_line, roi_current=None, weight_current=10.0, debug=False):
         h, w = roi.shape
 
         # --- resample manual_line to match ROI width ---
@@ -27,7 +27,16 @@ class JunctionAnalyzer:
         # --- Method : Canny with Bilateral pre-filtering, with post-processing ---
         try:
             filtered_roi = self._apply_preprocessing_filter(roi)
-            detected_roi_coords = self._detect_junction_canny(filtered_roi)
+            # If an EBIC/current ROI is provided, preprocess it similarly
+            filtered_current = None
+            if roi_current is not None:
+                try:
+                    filtered_current = self._apply_preprocessing_filter(roi_current)
+                except Exception:
+                    # If preprocessing fails, fall back to raw current ROI
+                    filtered_current = roi_current.astype(np.uint8)
+
+            detected_roi_coords = self._detect_junction_canny(filtered_roi, roi_current=filtered_current, weight_current=weight_current, debug=debug)
             if detected_roi_coords.shape[0] != w:
                 t_det = np.linspace(0.0, 1.0, detected_roi_coords.shape[0])
                 t_new = np.linspace(0.0, 1.0, w)
@@ -76,18 +85,60 @@ class JunctionAnalyzer:
 
         # Return the new, smoothed coordinates
         return np.column_stack([x_smooth, y_smooth])
+
+    def compute_gradient_stats(self, roi, roi_current):
+        """
+        Compute simple gradient statistics for SEM (roi) and EBIC/current (roi_current).
+
+        Returns dicts for sem_stats and curr_stats containing max, mean, median of absolute gradients,
+        and a ratios dict with max_ratio and mean_ratio (curr/sem).
+        """
+        sem = roi.astype(float)
+        cur = roi_current.astype(float)
+
+        # If shapes differ (SEM vs EBIC may have different ROI heights), crop to overlapping region
+        h_sem, w_sem = sem.shape
+        h_cur, w_cur = cur.shape
+        h = min(h_sem, h_cur)
+        w = min(w_sem, w_cur)
+        if (h, w) != (h_sem, w_sem):
+            sem = sem[:h, :w]
+        if (h, w) != (h_cur, w_cur):
+            cur = cur[:h, :w]
+
+        # per-column absolute gradient magnitudes (along rows)
+        sem_grads = np.abs(np.gradient(sem, axis=0))
+        cur_grads = np.abs(np.gradient(cur, axis=0))
+
+        # global stats
+        sem_stats = {"max": float(np.max(sem_grads)),
+                     "mean": float(np.mean(sem_grads)),
+                     "median": float(np.median(sem_grads))}
+        curr_stats = {"max": float(np.max(cur_grads)),
+                      "mean": float(np.mean(cur_grads)),
+                      "median": float(np.median(cur_grads))}
+
+        # compute ratio arrays where sem nonzero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio_arr = np.where(sem_grads != 0, cur_grads / (sem_grads + 1e-12), 0.0)
+
+        ratios = {"max_ratio": float(np.nanmax(ratio_arr)),
+                  "mean_ratio": float(np.nanmean(ratio_arr))}
+
+        return sem_stats, curr_stats, ratios
     
     # ---------------------------------------------------------------------
     # Canny detection
     # ---------------------------------------------------------------------
-    def _detect_junction_canny(self, roi):
-        """
-        Detect junction using Canny edge detection with Otsu's method for adaptive thresholding.
+    def _detect_junction_canny(self, roi, roi_current=None, weight_current=10.0, debug=False):
+        """Detect junction using Canny edge detection with Otsu's adaptive thresholds.
 
-        This function uses Otsu's method to automatically determine the optimal high and low
-        thresholds for the Canny edge detector.
+        Combines SEM and optional EBIC/current gradients per-column. When debug=True
+        a per-column summary is printed.
         """
         H, W = roi.shape
+
+        # Prepare output
         detected = np.zeros((W, 2), dtype=float)
 
         # Convert ROI to 8-bit for OpenCV processing
@@ -95,28 +146,102 @@ class JunctionAnalyzer:
 
         # Use Otsu's method to find the optimal threshold
         otsu_val, _ = cv2.threshold(roi_8bit, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Set Canny thresholds based on Otsu value
         high_thresh = float(otsu_val)
         low_thresh = 0.5 * high_thresh
 
         # Perform Canny edge detection
         edges = cv2.Canny(roi_8bit, low_thresh, high_thresh)
 
-        # Iterate through each column to find the most significant edge pixel
+        # Prepare current/EBIC processing
+        if roi_current is not None:
+            has_current = True
+            roi_current_f = roi_current.astype(float)
+            try:
+                sem_stats, curr_stats, ratios = self.compute_gradient_stats(roi, roi_current_f)
+                print("[JunctionAnalyzer] SEM grad max/mean/median:", sem_stats["max"], sem_stats["mean"], sem_stats["median"])
+                print("[JunctionAnalyzer] CUR grad max/mean/median:", curr_stats["max"], curr_stats["mean"], curr_stats["median"])
+                print(f"[JunctionAnalyzer] CUR/SEM max ratio: {ratios['max_ratio']:.6g}, mean ratio: {ratios['mean_ratio']:.6g}")
+            except Exception:
+                pass
+        else:
+            has_current = False
+            roi_current_f = None
+
+        per_column_debug = []
+
         for col in range(W):
             edge_rows = np.where(edges[:, col] > 0)[0]
-            if len(edge_rows) > 0:
-                profile = roi[:, col].astype(float)
-                grad = np.gradient(profile)
-                max_grad_idx = edge_rows[np.argmax(np.abs(grad[edge_rows]))]
-                row_idx = max_grad_idx
+            profile = roi[:, col].astype(float)
+            grad = np.gradient(profile)
+
+            curr_grad = None
+            if has_current:
+                curr_profile = roi_current_f[:, col]
+                curr_grad = np.gradient(curr_profile)
+
+            row_idx = 0
+            eps = 1e-12
+
+            if edge_rows.size > 0:
+                if curr_grad is None:
+                    sem_edge = np.abs(grad[edge_rows])
+                    sem_norm = sem_edge / (np.max(sem_edge) + eps)
+                    max_grad_idx = edge_rows[np.argmax(sem_norm)]
+                    row_idx = int(max_grad_idx)
+                    if debug:
+                        per_column_debug.append((col, 'sem_only', int(row_idx)))
+                else:
+                    sem_scores = np.abs(grad[edge_rows])
+                    curr_scores = np.abs(curr_grad[edge_rows])
+                    # per-column normalization on the edge pixels
+                    sem_norm = sem_scores / (np.max(sem_scores) + eps)
+                    curr_norm = curr_scores / (np.max(curr_scores) + eps)
+
+                    # neighborhood candidates
+                    neigh = 3
+                    candidates = []
+                    for r in edge_rows:
+                        r0 = max(0, r - neigh)
+                        r1 = min(H - 1, r + neigh)
+                        candidates.extend(range(r0, r1 + 1))
+                    candidates = np.unique(candidates)
+
+                    sem_col = np.abs(grad[candidates])
+                    curr_col = np.abs(curr_grad[candidates])
+                    sem_col_norm = sem_col / (np.max(sem_col) + eps)
+                    curr_col_norm = curr_col / (np.max(curr_col) + eps)
+                    comb_col = sem_col_norm + weight_current * curr_col_norm
+                    best_idx = int(candidates[np.argmax(comb_col)])
+                    row_idx = best_idx
+                    if debug:
+                        per_column_debug.append((col, 'combined_best', int(row_idx), float(np.max(sem_col_norm)), float(np.max(curr_col_norm))))
             else:
-                profile = roi[:, col].astype(float)
-                grad = np.gradient(profile)
-                row_idx = int(np.argmax(np.abs(grad)))
+                if curr_grad is None:
+                    col_abs = np.abs(grad)
+                    col_norm = col_abs / (np.max(col_abs) + eps)
+                    row_idx = int(np.argmax(col_norm))
+                    if debug:
+                        per_column_debug.append((col, 'sem_only_fallback', int(row_idx)))
+                else:
+                    sem_col = np.abs(grad)
+                    curr_col = np.abs(curr_grad)
+                    sem_col_norm = sem_col / (np.max(sem_col) + eps)
+                    curr_col_norm = curr_col / (np.max(curr_col) + eps)
+                    comb = sem_col_norm + weight_current * curr_col_norm
+                    row_idx = int(np.argmax(comb))
+                    if debug:
+                        per_column_debug.append((col, 'combined_fallback', int(row_idx)))
 
             detected[col] = [col, row_idx]
+
+        if debug:
+            print(f"[JunctionAnalyzer DEBUG] per-column entries: {len(per_column_debug)} (showing up to 20)")
+            for entry in per_column_debug[:20]:
+                print(" ", entry)
+            from collections import Counter
+            kinds = [e[1] for e in per_column_debug]
+            cnt = Counter(kinds)
+            print(f"[JunctionAnalyzer DEBUG] counts: {dict(cnt)}")
 
         return detected
 
@@ -171,13 +296,20 @@ class JunctionAnalyzer:
 
     def visualize_results(self, image, manual_line, results):
         """Plot the detection result on the original image."""
+        import matplotlib.pyplot as plt
         for name, line_imgcoords, metrics in results:
-            mean_dev, std_dev, max_dev, r2 = metrics
+            # metrics may be a 3-tuple (mean,std,max) or 4-tuple; handle both
+            if len(metrics) == 4:
+                mean_dev, std_dev, max_dev, r2 = metrics
+            else:
+                mean_dev, std_dev, max_dev = metrics
+                r2 = float('nan')
+
             fig, ax = plt.subplots()
             ax.imshow(image, cmap='gray', origin='upper')
             ax.plot(manual_line[:, 0], manual_line[:, 1], 'r--', label='Manual')
             ax.plot(line_imgcoords[:, 0], line_imgcoords[:, 1], '-', label=name)
-            ax.set_title(f"{name}\nMean: {mean_dev:.2f} µm, Std: {std_dev:.2f} µm, Max: {max_dev:.2f} µm, R²: {r2:.3f}")
+            ax.set_title(f"{name}\nMean: {mean_dev:.2f} µm, Std: {std_dev:.2f} µm, Max: {max_dev:.2f} µm, R²: {r2 if not np.isnan(r2) else 'n/a'}")
             ax.legend()
             plt.show()
 

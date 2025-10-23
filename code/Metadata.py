@@ -16,32 +16,39 @@ class Metadata:
         root = tree.getroot()
         desc = root.find('.//rdf:Description', ns)
 
-        def get_nested_value(tag):
+        def get_nested_value(tag, default=0.0):
+            """Try to read <tag><rdf:value>numeric</rdf:value></tag>, fallback to direct text.
+
+            Returns float(default) if value not found or not convertable.
+            """
             elem = desc.find(tag, ns)
             if elem is not None:
+                # prefer nested rdf:value
                 val = elem.find('rdf:value', ns)
-                if val is not None:
-                    return float(val.text)
-            return 0.0
-
-        # Helper to safely parse a possibly whitespace-wrapped text
-        def _safe_float(text, default):
+                if val is not None and val.text is not None:
+                    try:
+                        return float(val.text.strip())
+                    except Exception:
+                        pass
+                # fallback to direct text inside the tag
+                if elem.text is not None:
+                    try:
+                        return float(elem.text.strip())
+                    except Exception:
+                        pass
             try:
-                if text is None:
-                    text = default
-                return float(str(text).strip())
-            except Exception:
                 return float(default)
+            except Exception:
+                return 0.0
 
         return {
-            'PixelSizeX': _safe_float(desc.findtext('image:PixelSizeX', '1e-6', namespaces=ns), '1e-6'),
-            'Contrast': get_nested_value('efa:Contrast'),
-            # EffectiveAmpGain is nested under rdf:value in many XMPs -> use helper
-            'EffectiveAmpGain': get_nested_value('efa:EffectiveAmpGain'),
-            'OutputOffset': get_nested_value('efa:OutputOffset'),
-            'InputOffset': get_nested_value('efa:InputOffset'),
+            'PixelSizeX': float(desc.findtext('image:PixelSizeX', '1e-6', namespaces=ns)),
+            'Contrast': get_nested_value('efa:Contrast', 0.0),
+            'EffectiveAmpGain': get_nested_value('efa:EffectiveAmpGain', 1e6),
+            'OutputOffset': get_nested_value('efa:OutputOffset', 0.0),
+            'InputOffset': get_nested_value('efa:InputOffset', 0.0),
             'InverseEnabled': bool(int(desc.findtext('efa:InverseEnabled', '0', namespaces=ns))),
             'BiasEnabled': bool(int(desc.findtext('efa:BiasEnabled', '0', namespaces=ns))),
-            'BiasVoltage': get_nested_value('efa:Bias')
+            'BiasVoltage': get_nested_value('efa:Bias', 0.0)
         }
 
