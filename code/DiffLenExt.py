@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import os
 import numpy as np  
 from scipy.optimize import curve_fit
 
@@ -268,16 +269,16 @@ class DiffusionLengthExtractor:
         The left side is flipped during fitting, so we must invert back
         to get the correct starting coordinate.
         """
-        left_start = None
-        right_start = None
+        # Choose the best Left and Right fits by R² (fit quality). This avoids
+        # picking the last-fit in the list which may be a low-quality fit.
+        left_candidates = [r for r in fit_results if "Left" in r['side'] and r.get('r2') is not None]
+        right_candidates = [r for r in fit_results if "Right" in r['side'] and r.get('r2') is not None]
 
-        for res in fit_results:
-            if "Left" in res['side']:
-                # take the last x-value (unflipped end = real starting coordinate)
-                left_start = -res['x_vals'][0]
-            elif "Right" in res['side']:
-                # take the first x-value (true start on the right side)
-                right_start = res['x_vals'][0]
+        best_left = max(left_candidates, key=lambda r: r['r2']) if left_candidates else None
+        best_right = max(right_candidates, key=lambda r: r['r2']) if right_candidates else None
+
+        left_start = -best_left['x_vals'][0] if best_left is not None else None
+        right_start = best_right['x_vals'][0] if best_right is not None else None
 
         if left_start is not None and right_start is not None:
             depletion_width = abs(right_start - left_start)
@@ -287,7 +288,10 @@ class DiffusionLengthExtractor:
         return {
             "left_start": left_start,
             "right_start": right_start,
-            "depletion_width": depletion_width
+            "depletion_width": depletion_width,
+            # include chosen fits so callers can visualize the selected fit curves
+            "best_left_fit": best_left,
+            "best_right_fit": best_right,
         }
 
     def fit_all_profiles(self):
@@ -341,21 +345,65 @@ class DiffusionLengthExtractor:
             x = np.array(self.profiles[profile_id - 1]['dist_um'])
             y = np.array(self.profiles[profile_id - 1]['current'])
 
-            plt.figure(figsize=(8, 4))
-            plt.plot(x, y, 'k-', alpha=0.6, label="EBIC Profile")
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(x, y, 'k-', alpha=0.6, label="EBIC Profile")
 
-            if depletion['left_start'] is not None:
-                plt.axvline(depletion['left_start'], color='b', linestyle='--', label="Left Start")
-            if depletion['right_start'] is not None:
-                plt.axvline(depletion['right_start'], color='r', linestyle='--', label="Right Start")
+            left_start = depletion.get('left_start', None)
+            right_start = depletion.get('right_start', None)
 
-            plt.title(f"Profile {profile_id} – Depletion Width = {depletion['depletion_width']:.2f} µm")
-            plt.xlabel("Distance (µm)")
-            plt.ylabel("Current (nA)")
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.5)
-            plt.tight_layout()
-            plt.show()
+            # Shade depletion region if both edges present
+            if left_start is not None and right_start is not None:
+                ax.axvspan(left_start, right_start, color='green', alpha=0.12, label='Depletion zone')
+
+            # Draw vertical lines
+            if left_start is not None:
+                ax.axvline(left_start, color='b', linestyle='--', label="Left Start")
+            if right_start is not None:
+                ax.axvline(right_start, color='r', linestyle='--', label="Right Start")
+
+            # Overlay best-fit curves if available
+            best_left = depletion.get('best_left_fit', None)
+            best_right = depletion.get('best_right_fit', None)
+
+            if best_left is not None:
+                # best_left['x_vals'] are in positive distances measured from the fit side
+                # map them to the profile x-axis: for left side we negate to place on the left
+                x_fit_left = -np.array(best_left['x_vals'])
+                y_fit_left = np.array(best_left['fit_curve'])
+                ax.plot(x_fit_left, y_fit_left, 'b-', lw=1.6, alpha=0.9, label='Left fit (best)')
+                # annotate R²
+                ax.text(x_fit_left[0], y_fit_left[0], f"R²={best_left['r2']:.2f}", color='b')
+
+            if best_right is not None:
+                x_fit_right = np.array(best_right['x_vals'])
+                y_fit_right = np.array(best_right['fit_curve'])
+                ax.plot(x_fit_right, y_fit_right, 'r-', lw=1.6, alpha=0.9, label='Right fit (best)')
+                ax.text(x_fit_right[0], y_fit_right[0], f"R²={best_right['r2']:.2f}", color='r')
+
+            ax.set_title(f"Profile {profile_id} – Depletion Width = {depletion['depletion_width']:.2f} µm")
+            ax.set_xlabel("Distance (µm)")
+            ax.set_ylabel("Current (nA)")
+            ax.legend()
+            ax.grid(True, linestyle='--', alpha=0.5)
+            fig.tight_layout()
+            # Ensure a folder to save the per-profile depletion plot so the
+            # visualization is available even when no interactive window opens.
+            try:
+                out_dir = os.path.join(os.getcwd(), 'depletion_plots')
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f'profile_{profile_id:02d}_depletion.png')
+                fig.savefig(out_path, dpi=200, bbox_inches='tight')
+            except Exception:
+                out_path = None
+
+            # Show (if possible) and close to avoid many open windows
+            try:
+                plt.show()
+            except Exception:
+                pass
+            plt.close(fig)
+            if out_path:
+                print(f"Saved depletion plot to {out_path}")
 
     def apply_low_pass_filter(self, y_vals, cutoff_fraction=0.1, visualize=True):
         """
