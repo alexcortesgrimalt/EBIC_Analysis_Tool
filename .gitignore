@@ -5,41 +5,11 @@ __pycache__/
 # Virtual environment
 env_panteha/
 
-# Common alternative venv dirs
-venv/
-.venv/
-
 # VS Code settings
 .vscode/
 
 # Test output
 tiff_test_output/
 
-# Pytest and coverage
-.pytest_cache/
-htmlcov/
-.coverage
-coverage.xml
-
-# Build / packaging
-build/
-dist/
-*.egg-info/
-.eggs/
-pip-wheel-metadata/
-
-# IDEs
-.idea/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Type/checker caches
-.mypy_cache/
+# Depletion plots
+depletion_plots/

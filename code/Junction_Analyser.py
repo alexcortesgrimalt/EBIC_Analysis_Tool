@@ -9,7 +9,7 @@ class JunctionAnalyzer:
     def __init__(self, pixel_size_m):
         self.pixel_size_m = pixel_size_m  # meters per pixel
 
-    def detect(self, roi, manual_line, roi_current=None, weight_current=10.0, debug=False):
+    def detect(self, roi, manual_line, roi_current=None, weight_current=10.0, debug=True, sweep_weights=None, _sweep_call=False):
         h, w = roi.shape
 
         # --- resample manual_line to match ROI width ---
@@ -21,6 +21,35 @@ class JunctionAnalyzer:
             manual_line_rs = np.column_stack([fx(t_target), fy(t_target)])
         else:
             manual_line_rs = np.array(manual_line, dtype=float)
+
+        # If debug is requested, show the SEM and EBIC/current ROIs before processing
+        if debug:
+            try:
+                import matplotlib.pyplot as plt
+                if roi_current is not None:
+                    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+                    axes[0].imshow(roi, cmap='gray', origin='upper')
+                    axes[0].set_title('SEM ROI')
+                    axes[1].imshow(roi_current, cmap='viridis', origin='upper')
+                    axes[1].set_title('EBIC / Current ROI')
+                else:
+                    fig, ax = plt.subplots(1, 1, figsize=(5, 4))
+                    ax.imshow(roi, cmap='gray', origin='upper')
+                    ax.set_title('SEM ROI')
+                plt.tight_layout()
+                plt.show()
+            except Exception:
+                # Do not fail detection if plotting is unavailable
+                pass
+
+        # If user requested a weight sweep and we're not already inside a sweep, invoke it.
+        # Use _sweep_call to avoid recursive re-entry (visualize_weight_sweep calls detect()).
+        if sweep_weights is not None and not _sweep_call and debug:
+            try:
+                # Show the sweep (per-weight debug popups) and continue with normal detection.
+                self.visualize_weight_sweep(roi, manual_line, roi_current=roi_current, weights=tuple(sweep_weights), per_weight_debug=True, show=True)
+            except Exception:
+                pass
 
         results = []
 
@@ -50,6 +79,78 @@ class JunctionAnalyzer:
             detected_image_coords = self._map_detected_to_image_coords(manual_line_rs, postprocessed_roi_coords,
                                                                        roi_height=h)
             metrics = self._compare_with_manual(manual_line_rs, detected_image_coords)
+            # If debug is requested, show post-processed overlays: filtered ROI, detected ROI points,
+            # post-processed spline, manual line and mapped detected image coordinates.
+            if debug:
+                try:
+                    import matplotlib.pyplot as plt
+
+                    # Show filtered ROI with overlays
+                    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+                    ax.imshow(filtered_roi, cmap='gray', origin='upper')
+                    # detected_roi_coords are (col, row) in ROI coords
+                    ax.plot(detected_roi_coords[:, 0], detected_roi_coords[:, 1], 'y.', markersize=2, label='detected (ROI)')
+                    # postprocessed_roi_coords may be dense (spline)
+                    ax.plot(postprocessed_roi_coords[:, 0], postprocessed_roi_coords[:, 1], 'c-', linewidth=1, label='postproc spline')
+                    # mapped image coords are in image coordinates (x,y)
+                    ax.plot(detected_image_coords[:, 0], detected_image_coords[:, 1], 'r-', linewidth=1, label='mapped detected')
+                    # manual_line_rs is in image coords already (resampled manual line)
+                    ax.plot(manual_line_rs[:, 0], manual_line_rs[:, 1], 'g--', linewidth=1, label='manual line')
+                    # Overlay SEM Canny edges (compute with Otsu on the filtered ROI)
+                    try:
+                        roi8 = filtered_roi if filtered_roi.dtype == np.uint8 else cv2.normalize(filtered_roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                        otsu_r, _ = cv2.threshold(roi8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        edges_sem = cv2.Canny(roi8, 0.5 * float(otsu_r), float(otsu_r))
+                        ys_sem, xs_sem = np.where(edges_sem > 0)
+                        if ys_sem.size > 0:
+                            ax.scatter(xs_sem, ys_sem, s=1, c='magenta', label='SEM Canny')
+                    except Exception:
+                        pass
+
+                    ax.set_title('Filtered ROI with detected points and post-processed line')
+                    ax.legend(loc='best', fontsize='small')
+                    plt.tight_layout()
+                    plt.show()
+
+                    # If an EBIC/current ROI is available, show it side-by-side with its filtered version (if any)
+                    if roi_current is not None:
+                        try:
+                            fig2, axes2 = plt.subplots(1, 2, figsize=(10, 4))
+                            axes2[0].imshow(roi_current, cmap='viridis', origin='upper')
+                            axes2[0].set_title('Raw EBIC / Current ROI')
+                            # Overlay EBIC Canny on raw EBIC image
+                            try:
+                                roi_curr8_raw = roi_current if roi_current.dtype == np.uint8 else cv2.normalize(roi_current, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                                otsu_cr, _ = cv2.threshold(roi_curr8_raw, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                                edges_curr_raw = cv2.Canny(roi_curr8_raw, 0.5 * float(otsu_cr), float(otsu_cr))
+                                ys_c, xs_c = np.where(edges_curr_raw > 0)
+                                if ys_c.size > 0:
+                                    axes2[0].scatter(xs_c, ys_c, s=1, c='magenta', label='EBIC Canny')
+                            except Exception:
+                                pass
+
+                            if filtered_current is not None:
+                                axes2[1].imshow(filtered_current, cmap='viridis', origin='upper')
+                                axes2[1].set_title('Filtered EBIC / Current ROI')
+                                # Overlay EBIC Canny on filtered EBIC
+                                try:
+                                    roi_curr8 = filtered_current if filtered_current.dtype == np.uint8 else cv2.normalize(filtered_current, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                                    otsu_cc, _ = cv2.threshold(roi_curr8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                                    edges_curr = cv2.Canny(roi_curr8, 0.5 * float(otsu_cc), float(otsu_cc))
+                                    ys2, xs2 = np.where(edges_curr > 0)
+                                    if ys2.size > 0:
+                                        axes2[1].scatter(xs2, ys2, s=1, c='magenta')
+                                except Exception:
+                                    pass
+
+                            plt.tight_layout()
+                            plt.show()
+                        except Exception:
+                            pass
+                except Exception:
+                    # plotting errors should not break the detection flow
+                    pass
+
             results.append(("Canny (Filtered, Spline)", detected_image_coords, metrics))
         except Exception as e:
             print(f"[Canny (Filtered, Spline)] failed: {e}")
@@ -130,7 +231,7 @@ class JunctionAnalyzer:
     # ---------------------------------------------------------------------
     # Canny detection
     # ---------------------------------------------------------------------
-    def _detect_junction_canny(self, roi, roi_current=None, weight_current=10.0, debug=False):
+    def _detect_junction_canny(self, roi, roi_current=None, weight_current=10.0, debug=True):
         """Detect junction using Canny edge detection with Otsu's adaptive thresholds.
 
         Combines SEM and optional EBIC/current gradients per-column. When debug=True
@@ -144,13 +245,27 @@ class JunctionAnalyzer:
         # Convert ROI to 8-bit for OpenCV processing
         roi_8bit = roi.astype(np.uint8)
 
-        # Use Otsu's method to find the optimal threshold
+        # Use Otsu's method to find the optimal threshold for SEM
         otsu_val, _ = cv2.threshold(roi_8bit, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         high_thresh = float(otsu_val)
         low_thresh = 0.5 * high_thresh
 
-        # Perform Canny edge detection
+        # Perform Canny edge detection on SEM
         edges = cv2.Canny(roi_8bit, low_thresh, high_thresh)
+
+        # If EBIC/current ROI is provided, also compute Canny on it and combine edge pixels
+        curr_edges = None
+        if roi_current is not None:
+            try:
+                roi_curr_8 = roi_current.astype(np.uint8)
+                otsu_cur, _ = cv2.threshold(roi_curr_8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                high_cur = float(otsu_cur)
+                low_cur = 0.5 * high_cur
+                curr_edges = cv2.Canny(roi_curr_8, low_cur, high_cur)
+                if debug:
+                    print(f"[JunctionAnalyzer] EBIC Canny thresholds: low={low_cur:.2f}, high={high_cur:.2f}")
+            except Exception:
+                curr_edges = None
 
         # Prepare current/EBIC processing
         if roi_current is not None:
@@ -170,7 +285,19 @@ class JunctionAnalyzer:
         per_column_debug = []
 
         for col in range(W):
-            edge_rows = np.where(edges[:, col] > 0)[0]
+            # start from SEM edge pixels
+            edge_rows_sem = np.where(edges[:, col] > 0)[0]
+            # include EBIC/current edge pixels if available
+            if curr_edges is not None:
+                edge_rows_curr = np.where(curr_edges[:, col] > 0)[0]
+            else:
+                edge_rows_curr = np.array([], dtype=int)
+
+            # union of SEM and EBIC edge rows
+            if edge_rows_sem.size == 0 and edge_rows_curr.size == 0:
+                edge_rows = np.array([], dtype=int)
+            else:
+                edge_rows = np.unique(np.concatenate([edge_rows_sem, edge_rows_curr]))
             profile = roi[:, col].astype(float)
             grad = np.gradient(profile)
 
@@ -312,6 +439,175 @@ class JunctionAnalyzer:
             ax.set_title(f"{name}\nMean: {mean_dev:.2f} µm, Std: {std_dev:.2f} µm, Max: {max_dev:.2f} µm, R²: {r2 if not np.isnan(r2) else 'n/a'}")
             ax.legend()
             plt.show()
+
+
+    def visualize_weight_sweep(self, roi, manual_line, roi_current=None, weights=(0, 10, 100, 1000), figsize=(10, 6), save_path=None, show=True, per_weight_debug=True, save_per_weight_dir=None, separate_edges_plot=True):
+        """Run detection for multiple EBIC weightings and plot all detected lines on one image.
+
+        Parameters
+        - roi: 2D SEM ROI (array-like)
+        - manual_line: Nx2 array of manual coordinates (image coords)
+        - roi_current: optional EBIC/current ROI (same shape as roi or compatible)
+        - weights: iterable of weight_current values to test
+        - figsize: figure size for plotting
+        - save_path: optional path to save the figure instead of only showing
+        - show: whether to call plt.show()
+
+        Returns a list of (weight, detected_coords, metrics) tuples (detected_coords may be None on failure).
+        """
+        import matplotlib.pyplot as plt
+
+        results = []
+        for w in weights:
+            try:
+                # run detection without GUI popups (we'll save per-weight images explicitly if requested)
+                print(f"[visualize_weight_sweep] running detect with weight={w}")
+                # honor per_weight_debug: if True, detect will show its debug plots (plt.show())
+                res = self.detect(roi, manual_line, roi_current=roi_current, weight_current=w, debug=per_weight_debug)
+                if res and len(res) > 0:
+                    # take the first method result
+                    _, coords, metrics = res[0]
+                    results.append((w, coords, metrics))
+                else:
+                    results.append((w, None, None))
+            except Exception:
+                print(f"[visualize_weight_sweep] detection failed for weight={w}")
+                results.append((w, None, None))
+
+            # If requested, save a per-weight diagnostic image (non-blocking)
+            if save_per_weight_dir is not None:
+                try:
+                    import os
+                    import matplotlib.pyplot as plt
+                    os.makedirs(save_per_weight_dir, exist_ok=True)
+                    fname = os.path.join(save_per_weight_dir, f"sweep_weight_{w}.png")
+                    figw, axw = plt.subplots(1, 1, figsize=(8, 6))
+                    axw.imshow(roi, cmap='gray', origin='upper')
+                    # manual line
+                    try:
+                        ml = np.array(manual_line, dtype=float)
+                        axw.plot(ml[:, 0], ml[:, 1], 'k--', linewidth=1.0, label='manual')
+                    except Exception:
+                        pass
+                    # detected line
+                    if res and len(res) > 0 and res[0][1] is not None:
+                        try:
+                            axw.plot(res[0][1][:, 0], res[0][1][:, 1], 'r-', linewidth=1.0, label=f'weight={w}')
+                        except Exception:
+                            pass
+                    # EBIC edges
+                    if roi_current is not None:
+                        try:
+                            roi_curr8 = roi_current if roi_current.dtype == np.uint8 else cv2.normalize(roi_current, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                            otsu_c, _ = cv2.threshold(roi_curr8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                            edges_curr = cv2.Canny(roi_curr8, 0.5 * float(otsu_c), float(otsu_c))
+                            ys_c, xs_c = np.where(edges_curr > 0)
+                            if ys_c.size > 0:
+                                axw.scatter(xs_c, ys_c, s=2, c='yellow', alpha=0.9, label='EBIC Canny')
+                        except Exception:
+                            pass
+                    axw.set_title(f"Weight {w}")
+                    axw.legend(fontsize='small')
+                    plt.tight_layout()
+                    figw.savefig(fname, dpi=200)
+                    plt.close(figw)
+                    print(f"[visualize_weight_sweep] saved per-weight image: {fname}")
+                except Exception as e:
+                    print(f"[visualize_weight_sweep] failed to save per-weight image for weight={w}: {e}")
+
+        # Plot all results on one image
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        ax.imshow(roi, cmap='gray', origin='upper')
+        # manual line (plot in black dashed)
+        try:
+            ml = np.array(manual_line, dtype=float)
+            ax.plot(ml[:, 0], ml[:, 1], 'k--', linewidth=1.0, label='manual')
+        except Exception:
+            pass
+
+        colors = ['r', 'g', 'b', 'm', 'c', 'y']
+        for i, (w, coords, metrics) in enumerate(results):
+            if coords is None:
+                print(f"[visualize_weight_sweep] no detected line for weight={w}")
+                continue
+            col = colors[i % len(colors)]
+            try:
+                # plot line and small semi-transparent markers so overlapping lines are visible
+                ax.plot(coords[:, 0], coords[:, 1], color=col, linewidth=1.2, alpha=0.9, label=f'weight={w}')
+                ax.scatter(coords[:, 0], coords[:, 1], s=4, c=col, alpha=0.6)
+                print(f"[visualize_weight_sweep] weight={w} detected {coords.shape[0]} points")
+            except Exception:
+                print(f"[visualize_weight_sweep] plotting failed for weight={w}")
+                continue
+
+        # If EBIC/current ROI is present, overlay its Canny edges on the combined plot for reference
+        if roi_current is not None:
+            try:
+                roi_curr8 = roi_current if roi_current.dtype == np.uint8 else cv2.normalize(roi_current, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                otsu_c, _ = cv2.threshold(roi_curr8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                edges_curr = cv2.Canny(roi_curr8, 0.5 * float(otsu_c), float(otsu_c))
+                ys_c, xs_c = np.where(edges_curr > 0)
+                if ys_c.size > 0:
+                    ax.scatter(xs_c, ys_c, s=2, c='yellow', alpha=0.9, label='EBIC Canny')
+                    print(f"[visualize_weight_sweep] EBIC Canny edges count: {ys_c.size}")
+            except Exception:
+                pass
+
+        # Optionally create a separate plot that shows only the EBIC/Current edges (and detected lines)
+        if roi_current is not None and separate_edges_plot:
+            try:
+                fig_e, ax_e = plt.subplots(1, 1, figsize=(6, 6))
+                roi_curr8 = roi_current if roi_current.dtype == np.uint8 else cv2.normalize(roi_current, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                ax_e.imshow(roi_curr8, cmap='viridis', origin='upper')
+                otsu_ce, _ = cv2.threshold(roi_curr8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                edges_ce = cv2.Canny(roi_curr8, 0.5 * float(otsu_ce), float(otsu_ce))
+                ys_ce, xs_ce = np.where(edges_ce > 0)
+                if ys_ce.size > 0:
+                    ax_e.scatter(xs_ce, ys_ce, s=2, c='yellow', alpha=0.9, label='EBIC Canny')
+
+                # overlay detected lines on the separate edges plot for quick comparison
+                for i, (w, coords, metrics) in enumerate(results):
+                    if coords is None:
+                        continue
+                    try:
+                        ax_e.plot(coords[:, 0], coords[:, 1], '-', linewidth=0.9, alpha=0.7, label=f'weight={w}')
+                    except Exception:
+                        pass
+
+                ax_e.set_title('EBIC Canny edges (separate) and detected lines')
+                ax_e.legend(fontsize='small')
+                plt.tight_layout()
+                # if a save_path for the combined figure was given, save an edges-only sibling file
+                if save_path:
+                    try:
+                        import os
+                        base, ext = os.path.splitext(save_path)
+                        fname_edges = base + '_edges' + (ext if ext else '.png')
+                        fig_e.savefig(fname_edges, dpi=200)
+                        print(f"[visualize_weight_sweep] saved edges-only image: {fname_edges}")
+                    except Exception:
+                        pass
+                if show:
+                    plt.show()
+                else:
+                    plt.close(fig_e)
+            except Exception:
+                pass
+
+        ax.set_title(f"Detected lines (weights: {', '.join(str(x) for x in weights)})")
+        ax.legend(fontsize='small', loc='best')
+        plt.tight_layout()
+        if save_path:
+            try:
+                fig.savefig(save_path, dpi=200)
+            except Exception:
+                pass
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        return results
 
 
     def _fit_line_postprocessing(self, detected_coords):
