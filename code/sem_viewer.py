@@ -786,67 +786,73 @@ class SEMViewer:
             print("No profiles to plot.")
             return
 
-        # --- Draw perpendicular lines on main viewer ---
-        if hasattr(self, 'ax') and self.ax:
-            self.perp_lines = getattr(self, 'perp_lines', [])
-            for prof in profiles:
-                p_start, p_end = prof["line_coords"]
-                line, = self.ax.plot([p_start[0], p_end[0]], [p_start[1], p_end[1]], 'r--', linewidth=1)
-                self.perp_lines.append(line)
-                # Draw intersection if available
-                if prof.get("intersection") is not None:
-                    inter = prof["intersection"]
-                    self.ax.scatter(inter[0], inter[1], color='lime', s=50, marker='x', zorder=20)
+        # Delegate plotting to the shared perpendicular plotting utility which
+        # draws the perpendicular lines on the main viewer (if ax/fig passed)
+        # and opens a scrollable window with stacked SEM + log10(Current) plots.
+        try:
+            plot_perpendicular_profiles(profiles, ax=getattr(self, 'ax', None), fig=getattr(self, 'fig', None))
+        except Exception as e:
+            print("Failed to open stacked perpendicular plots, falling back to simple plots:", e)
+            # Fallback: draw simple twin-y plots as before
+            if hasattr(self, 'ax') and self.ax:
+                self.perp_lines = getattr(self, 'perp_lines', [])
+                for prof in profiles:
+                    p_start, p_end = prof["line_coords"]
+                    line, = self.ax.plot([p_start[0], p_end[0]], [p_start[1], p_end[1]], 'r--', linewidth=1)
+                    self.perp_lines.append(line)
+                    if prof.get("intersection") is not None:
+                        inter = prof["intersection"]
+                        self.ax.scatter(inter[0], inter[1], color='lime', s=50, marker='x', zorder=20)
 
-            if hasattr(self, 'fig') and self.fig:
-                self.fig.canvas.draw_idle()
+                if hasattr(self, 'fig') and self.fig:
+                    self.fig.canvas.draw_idle()
 
-        # --- Scrollable profile plot window ---
-        win = tk.Toplevel()
-        win.title("Perpendicular Profiles (Manual Line)")
-        win.geometry("1200x800")
-        win.resizable(True, True)
-        win.lift()
-        win.focus_force()
-
-        canvas = tk.Canvas(win)
-        scrollbar = tk.Scrollbar(win, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas)
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        for prof in profiles:
-            dist_um = prof["dist_um"]
-            sem_vals = prof["sem"]
-            cur_vals = prof["current"]
-
-            sem_vals_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals) + 1e-12)
-
-            fig, ax1 = plt.subplots(figsize=(6, 3))
-            ax1.plot(dist_um, sem_vals_norm, color='tab:blue', linewidth=2, label='SEM (norm)')
-            ax2 = ax1.twinx()
-            ax2.plot(dist_um, cur_vals, color='tab:red', linewidth=1.5, label='Current (nA)')
-
-            # Mark intersection point
-            if prof.get("intersection_idx") is not None:
-                idx = prof["intersection_idx"]
-                ax1.scatter(dist_um[idx], sem_vals_norm[idx], color='lime', s=50, marker='x', zorder=10)
-                ax2.scatter(dist_um[idx], cur_vals[idx], color='lime', s=50, marker='x', zorder=10)
-
-            ax1.set_xlabel("Distance (µm)")
-            ax1.set_ylabel("SEM Contrast (norm)", color='tab:blue')
-            ax2.set_ylabel("Current (nA)", color='tab:red')
-            ax1.set_title(f"Perpendicular {prof['id'] + 1}")
-            ax1.legend(loc='upper left')
-            fig.tight_layout()
-
+            import tkinter as tk
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-            plot_canvas = FigureCanvasTkAgg(fig, master=scroll_frame)
-            widget = plot_canvas.get_tk_widget()
-            widget.pack(pady=10)
+            win = tk.Toplevel()
+            win.title("Perpendicular Profiles (Manual Line)")
+            win.geometry("1200x800")
+            win.resizable(True, True)
+            win.lift()
+            win.focus_force()
+
+            canvas = tk.Canvas(win)
+            scrollbar = tk.Scrollbar(win, orient="vertical", command=canvas.yview)
+            scroll_frame = tk.Frame(canvas)
+            scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+
+            for prof in profiles:
+                dist_um = prof["dist_um"]
+                sem_vals = prof["sem"]
+                cur_vals = prof["current"]
+
+                sem_vals_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals) + 1e-12)
+
+                fig, ax1 = plt.subplots(figsize=(6, 3))
+                ax1.plot(dist_um, sem_vals_norm, color='tab:blue', linewidth=2, label='SEM (norm)')
+                ax2 = ax1.twinx()
+                ax2.plot(dist_um, cur_vals, color='tab:red', linewidth=1.5, label='Current (nA)')
+
+                # Mark intersection point
+                if prof.get("intersection_idx") is not None:
+                    idx = prof["intersection_idx"]
+                    ax1.scatter(dist_um[idx], sem_vals_norm[idx], color='lime', s=50, marker='x', zorder=10)
+                    ax2.scatter(dist_um[idx], cur_vals[idx], color='lime', s=50, marker='x', zorder=10)
+
+                ax1.set_xlabel("Distance (µm)")
+                ax1.set_ylabel("SEM Contrast (norm)", color='tab:blue')
+                ax2.set_ylabel("Current (nA)", color='tab:red')
+                ax1.set_title(f"Perpendicular {prof['id'] + 1}")
+                ax1.legend(loc='upper left')
+                fig.tight_layout()
+
+                plot_canvas = FigureCanvasTkAgg(fig, master=scroll_frame)
+                widget = plot_canvas.get_tk_widget()
+                widget.pack(pady=10)
 
 
     def _reset_overlays(self, event=None):

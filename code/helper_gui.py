@@ -304,6 +304,11 @@ def fit_perpendicular_profiles(viewer):
     extractor.load_profiles(viewer.perpendicular_profiles)
     extractor.fit_all_profiles()
     extractor.visualize_fitted_profiles()
+    # Also show log(EBIC) vs distance plots (saved to disk)
+    try:
+        extractor.visualize_log_profiles()
+    except Exception as e:
+        print("Error while plotting log profiles:", e)
     extractor.visualize_depletion_regions()
     averages = extractor.compute_average_lengths(show_table=True)
     
@@ -389,6 +394,13 @@ def generate_perpendicular_profiles(viewer, num_lines, length_um):
     
     viewer.perpendicular_profiles = profiles
     plot_perpendicular_profiles(profiles, ax=viewer.ax, fig=viewer.fig)
+    # Also save log(EBIC) vs distance plots for the generated perpendicular profiles
+    try:
+        extractor = DiffusionLengthExtractor(viewer.pixel_size, smoothing_sigma=1)
+        extractor.load_profiles(profiles)
+        extractor.visualize_log_profiles()
+    except Exception as e:
+        print("Failed to create log plots for perpendicular profiles:", e)
 
 
 def enable_windows_dpi_awareness():

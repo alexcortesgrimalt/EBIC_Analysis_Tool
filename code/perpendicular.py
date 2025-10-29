@@ -91,6 +91,7 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None):
     # Plot each perpendicular profile
     import tkinter as tk
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    import os
     win = tk.Toplevel()
     win.title("Perpendicular Profiles")
     win.geometry("1200x800")
@@ -107,20 +108,61 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None):
         sem_vals = prof["sem"]
         cur_vals = prof["current"]
         sem_vals_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals)+1e-12)
-        fig_prof, ax1 = plt.subplots(figsize=(6,3))
+        # Create a 2-row plot: top = SEM (normalized) + Current (linear) via twin y,
+        # bottom = log10(Current)
+        fig_prof, (ax1, ax_log) = plt.subplots(2, 1, sharex=True, figsize=(6, 5), gridspec_kw={'height_ratios': [1, 1]})
         ax1.plot(dist_um, sem_vals_norm, color='tab:blue', linewidth=2, label='SEM (norm)')
-        ax2 = ax1.twinx()
-        ax2.plot(dist_um, cur_vals, color='tab:red', linewidth=1.5, label='Current')
+
+        # Plot linear current on a twin axis above (original behavior)
+        ax1b = ax1.twinx()
+        cur = np.array(cur_vals)
+        ax1b.plot(dist_um, cur, color='tab:red', linewidth=1.2, label='Current (nA)')
+
+        # Prepare safe current for plotting and set log y-scale on lower axis
+        pos = cur[cur > 0]
+        if pos.size > 0:
+            floor = max(np.min(pos) * 0.1, 1e-12)
+        else:
+            floor = 1e-12
+        cur_safe = np.maximum(cur, floor)
+
+        # Plot raw current values but use a logarithmic y-axis for the lower subplot
+        ax_log.plot(dist_um, cur_safe, color='tab:orange', linewidth=1.5, label='Current (nA)')
+        ax_log.set_yscale('log')
+
+        # Mark intersection point on all axes if available
         if prof.get("intersection_idx") is not None:
             idx = prof["intersection_idx"]
             ax1.scatter(dist_um[idx], sem_vals_norm[idx], color='lime', s=50, marker='x', zorder=10)
-            ax2.scatter(dist_um[idx], cur_vals[idx], color='lime', s=50, marker='x', zorder=10)
-        ax1.set_xlabel("Distance (µm)")
+            ax1b.scatter(dist_um[idx], cur[idx], color='lime', s=50, marker='x', zorder=10)
+            ax_log.scatter(dist_um[idx], cur_safe[idx], color='lime', s=50, marker='x', zorder=10)
+
         ax1.set_ylabel("SEM Contrast (norm)", color='tab:blue')
-        ax2.set_ylabel("Current (nA)", color='tab:red')
+        ax1b.set_ylabel("Current (nA)", color='tab:red')
+        ax_log.set_xlabel("Distance (µm)")
+        ax_log.set_ylabel("Current (nA) [log scale]", color='tab:orange')
         ax1.set_title(f"Perpendicular {prof['id']+1}")
-        ax1.legend(loc='upper left')
+
+        # Combine legends from ax1 and ax1b
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1b.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        ax_log.legend(loc='upper left')
         fig_prof.tight_layout()
         canvas_plot = FigureCanvasTkAgg(fig_prof, master=scroll_frame)
+        try:
+            canvas_plot.draw()
+        except Exception:
+            pass
         widget = canvas_plot.get_tk_widget()
         widget.pack(pady=10)
+
+        # Also save the figure to disk as a fallback so you always get the log plot
+        try:
+            out_dir = os.path.join(os.getcwd(), 'perpendicular_plots')
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f'perp_{prof["id"]+1:02d}.png')
+            fig_prof.savefig(out_path, dpi=200, bbox_inches='tight')
+            print(f"Saved perpendicular plot to {out_path}")
+        except Exception as e:
+            print("Failed to save perpendicular plot:", e)

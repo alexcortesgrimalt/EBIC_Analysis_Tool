@@ -500,6 +500,141 @@ class DiffusionLengthExtractor:
                 ax.legend()
             fig_fit.tight_layout()
             plt.show()
+            plt.close(fig_fit)
+
+    def visualize_log_profiles(self, base='10', smooth=True, cutoff_fraction=0.05,
+                               floor_factor=0.1, subtract_baseline=True):
+        """
+        Plot log(EBIC) vs distance for each profile and save the plots.
+
+        Parameters
+        ----------
+        base : {'10', 'e'}
+            Logarithm base to use: '10' for log10, 'e' for natural log.
+        smooth : bool
+            Whether to apply the low-pass filter before taking the log.
+        cutoff_fraction : float
+            Cutoff fraction passed to apply_low_pass_filter when smoothing.
+        floor_factor : float
+            Fraction of the minimum positive EBIC value used as floor for
+            non-positive or negative values (to allow taking the logarithm).
+        subtract_baseline : bool
+            If True, attempt to subtract a baseline (y0) estimated from the
+            best fits (if available) or from the tail median before taking log.
+        """
+        # Allow plotting even if fits/results are not available: use raw loaded profiles
+        data_source = None
+        if self.results:
+            data_source = 'results'
+            iterable = self.results
+        elif getattr(self, 'profiles', None):
+            data_source = 'profiles'
+            # build simple result-like dicts pointing to profiles
+            iterable = []
+            for i, prof in enumerate(self.profiles):
+                iterable.append({'Profile': i + 1})
+        else:
+            print("No fitted results or profiles to visualize.")
+            return
+
+        for res in iterable:
+            profile_id = res['Profile']
+            x = np.array(self.profiles[profile_id - 1]['dist_um'])
+            y = np.array(self.profiles[profile_id - 1]['current'])
+
+            # Optionally smooth first (recommended to reduce high-frequency noise)
+            if smooth:
+                y_plot = self.apply_low_pass_filter(y, cutoff_fraction=cutoff_fraction, visualize=False)
+            else:
+                y_plot = y.copy()
+
+            # Baseline subtraction: prefer fit-derived y0 if available and sensible
+            baseline = 0.0
+            if subtract_baseline:
+                best_left = res.get('depletion', {}).get('best_left_fit', None)
+                best_right = res.get('depletion', {}).get('best_right_fit', None)
+                y0_cands = []
+                for b in (best_left, best_right):
+                    if b is not None and 'parameters' in b:
+                        try:
+                            y0_cands.append(float(b['parameters'][2]))
+                        except Exception:
+                            pass
+                if y0_cands:
+                    # Use the smaller baseline (more conservative)
+                    baseline = max(min(y0_cands), 0.0)
+                else:
+                    # Fallback: median of last 10 points
+                    tail = y_plot[-10:]
+                    baseline = max(np.median(tail), 0.0)
+
+            # Subtract baseline and floor
+            y_corr = y_plot - baseline
+            pos = y_corr[y_corr > 0]
+            if pos.size > 0:
+                floor = max(np.min(pos) * floor_factor, 1e-12)
+            else:
+                floor = 1e-12
+
+            y_safe = np.maximum(y_corr, floor)
+
+            # Choose log base
+            if base == '10':
+                logy = np.log10(y_safe)
+                ylabel = 'log10(Current)'
+            else:
+                logy = np.log(y_safe)
+                ylabel = 'ln(Current)'
+
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(x, logy, 'k-', lw=1.2, label=f'{ylabel}')
+
+            # Optionally overlay best-fit transformed to log domain
+            best_left = res.get('depletion', {}).get('best_left_fit', None)
+            best_right = res.get('depletion', {}).get('best_right_fit', None)
+            for b, color, label in ((best_left, 'b', 'Left fit'), (best_right, 'r', 'Right fit')):
+                if b is None:
+                    continue
+                try:
+                    x_fit = np.array(b['x_vals'])
+                    y_fit = np.array(b['fit_curve'])
+                    # transform fit by the same baseline subtraction
+                    y_fit_corr = y_fit - baseline
+                    y_fit_corr = np.maximum(y_fit_corr, floor)
+                    if base == '10':
+                        y_fit_log = np.log10(y_fit_corr)
+                    else:
+                        y_fit_log = np.log(y_fit_corr)
+                    # For left fit, x_fit was from flipped side
+                    if 'Left' in b['side']:
+                        x_fit_plot = -x_fit
+                    else:
+                        x_fit_plot = x_fit
+                    ax.plot(x_fit_plot, y_fit_log, color=color, lw=1.6, alpha=0.9, label=f'{label} (log)')
+                except Exception:
+                    pass
+
+            ax.set_xlabel('Distance (µm)')
+            ax.set_ylabel(ylabel)
+            ax.set_title(f'Profile {profile_id} — {ylabel} vs distance (baseline={baseline:.3g})')
+            ax.grid(True, linestyle='--', alpha=0.5)
+
+            fig.tight_layout()
+            try:
+                out_dir = os.path.join(os.getcwd(), 'depletion_plots')
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f'profile_{profile_id:02d}_log.png')
+                fig.savefig(out_path, dpi=200, bbox_inches='tight')
+            except Exception:
+                out_path = None
+
+            try:
+                plt.show()
+            except Exception:
+                pass
+            plt.close(fig)
+            if out_path:
+                print(f"Saved log profile plot to {out_path}")
 
 
 
