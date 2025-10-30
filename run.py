@@ -1,8 +1,6 @@
 """Launcher that runs the project package entrypoint.
 
-Use this when you want to run the application from the repo root as a script.
-It imports the `code` package and executes `code.main` as a module so package-relative
-imports work correctly.
+Use this when you want to run the application from the repo.
 """
 import importlib
 import sys

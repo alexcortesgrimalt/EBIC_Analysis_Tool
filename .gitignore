@@ -7,3 +7,9 @@ env_panteha/
 
 # VS Code settings
 .vscode/
+
+# Test output
+tiff_test_output/
+
+# Depletion plots
+depletion_plots/
