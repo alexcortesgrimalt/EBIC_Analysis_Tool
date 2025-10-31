@@ -18,9 +18,6 @@ from .Junction_Analyser import JunctionAnalyzer
 from .ROI_extractor import extract_line_rectangle
 from .perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles
 
-
-# ==================== Dialog Functions ====================
-
 def ask_junction_width():
     """
     Show dialog to ask for junction width.
@@ -67,9 +64,6 @@ def ask_junction_weight():
     finally:
         root.destroy()
     return weight
-
-
-# ==================== Colorbar and Display Utilities ====================
 
 def safe_remove_colorbar(viewer):
     """
@@ -120,9 +114,6 @@ def draw_scalebar(ax, pixel_size, length_um=1.0, height_px=5, color='white', fon
     ax.text(x0 + length_px / 2, y0 - height_px * 1.5, f"{length_um} µm",
             color=color, ha='center', va='bottom', fontsize=font_size, clip_on=False)
 
-
-# ==================== Line Profile Extraction ====================
-
 def extract_line_profile_data(line_coords, data_array, pixel_size):
     """
     Extract profile data along a line.
@@ -160,8 +151,6 @@ def extract_line_profile_data(line_coords, data_array, pixel_size):
     
     return distances_um, profile_values
 
-
-# ==================== Line Profile Plotting ====================
 
 def plot_line_profile(viewer):
     """
@@ -313,6 +302,125 @@ def fit_perpendicular_profiles(viewer):
     averages = extractor.compute_average_lengths(show_table=True)
     
     return averages
+
+
+def fit_perpendicular_profiles_linear(viewer):
+    """
+    Fit two linear slopes on the log-scale of EBIC current for each perpendicular profile.
+
+    This mirrors `fit_perpendicular_profiles` but instead of fitting exponentials
+    it fits two straight lines to ln(current) on the left and right side of the
+    intersection. Results are plotted and a summary list is returned.
+    """
+    if not hasattr(viewer, "perpendicular_profiles") or not viewer.perpendicular_profiles:
+        print("No perpendicular profiles available. Draw them first.")
+        return None
+
+    results = []
+    extractor = DiffusionLengthExtractor(viewer.pixel_size, smoothing_sigma=1)
+
+    for prof in viewer.perpendicular_profiles:
+        profile_id = prof.get('id', None)
+        x = np.array(prof['dist_um'], dtype=float)
+        y = np.array(prof['current'], dtype=float)
+
+        # Determine intersection index if provided, otherwise use center (peak)
+        intersection_idx = prof.get('intersection_idx', None)
+        if intersection_idx is None:
+            intersection_idx = int(len(x) // 2)
+
+        # Baseline estimation: median of tail (last 10 points)
+        tail = y[-10:]
+        baseline = max(np.median(tail), 0.0)
+
+        # Subtract baseline and floor small positives to allow log10
+        y_corr = y - baseline
+        pos = y_corr[y_corr > 0]
+        if pos.size > 0:
+            floor = max(np.min(pos) * 0.1, 1e-12)
+        else:
+            floor = 1e-12
+        y_safe = np.maximum(y_corr, floor)
+
+        # Use extractor iterative linear routine but suppress its internal plotting
+        try:
+            sides = extractor.fit_profile_sides_iterative_linear(
+                x_vals=x, y_vals=y,
+                intersection_idx=intersection_idx,
+                profile_id=profile_id,
+                plot_left=False, plot_right=False,
+                max_iter=8, tol_factor=1.0
+            )
+        except Exception:
+            sides = []
+
+        # choose best left/right by R^2
+        left_candidates = [s for s in sides if 'Left' in s.get('side', '') and s.get('r2') is not None]
+        right_candidates = [s for s in sides if 'Right' in s.get('side', '') and s.get('r2') is not None]
+        best_left = max(left_candidates, key=lambda r: r['r2']) if left_candidates else None
+        best_right = max(right_candidates, key=lambda r: r['r2']) if right_candidates else None
+
+        # Prepare results entry
+        results.append({
+            'id': profile_id,
+            'intersection_idx': intersection_idx,
+            'baseline': baseline,
+            'floor': floor,
+            'left_fit': best_left,
+            'right_fit': best_right,
+            'all_fits': sides
+        })
+
+        # Plot per-profile log10 plot with all tailcut fits (faint) and best fits highlighted
+        try:
+            logy = np.log(y_safe)
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(x, logy, 'k.-', lw=1.0, ms=4, label='ln(Current)')
+
+            # Plot all tailcut fits faintly (converted from natural log to log10)
+            for s in sides:
+                try:
+                    slope = float(s.get('slope'))
+                    intercept = float(s.get('intercept'))
+                    x_fit = np.array(s.get('x_vals', s.get('x', [])), dtype=float)
+                    # natural-log fit -> plotting in natural-log (no conversion)
+                    y_log_nat = slope * x_fit + intercept
+                    y_log10 = y_log_nat
+                    # For left-side fits, x_vals were measured positively from the side -> negate for plotting
+                    if 'Left' in s.get('side', ''):
+                        x_plot = -x_fit
+                        ax.plot(x_plot, y_log10, color='blue', alpha=0.25, linewidth=1)
+                    else:
+                        ax.plot(x_fit, y_log10, color='red', alpha=0.25, linewidth=1)
+                except Exception:
+                    continue
+
+            # Highlight best fits
+            if best_left is not None:
+                sx = np.array(best_left.get('x_vals', best_left.get('x', [])), dtype=float)
+                yln = best_left['slope'] * sx + best_left['intercept']
+                yb10 = yln / np.log(10.0)
+                ax.plot(-sx, yb10, 'b-', lw=2.2, label=f"Best Left (s={best_left['slope']:.3g}, R²={best_left['r2']:.2f})")
+            if best_right is not None:
+                sx = np.array(best_right.get('x_vals', best_right.get('x', [])), dtype=float)
+                yln = best_right['slope'] * sx + best_right['intercept']
+                yb10 = yln / np.log(10.0)
+                ax.plot(sx, yb10, 'r-', lw=2.2, label=f"Best Right (s={best_right['slope']:.3g}, R²={best_right['r2']:.2f})")
+
+            # Mark intersection (at x=0)
+            ax.axvline(0.0, color='lime', linestyle='--', alpha=0.7)
+
+            ax.set_xlabel('Distance (µm)')
+            ax.set_ylabel('ln(Current)')
+            ax.set_title(f"Profile {profile_id if profile_id is not None else ''} - Linear fits on ln(Current)")
+            ax.grid(True, linestyle='--', alpha=0.5)
+            ax.legend(fontsize='small')
+            plt.tight_layout()
+            plt.show()
+        except Exception:
+            pass
+
+    return results
 
 
 def detect_junction(viewer):

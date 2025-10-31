@@ -13,3 +13,6 @@ tiff_test_output/
 
 # Depletion plots
 depletion_plots/
+
+# perpendicular plots
+perpendicular_plots/

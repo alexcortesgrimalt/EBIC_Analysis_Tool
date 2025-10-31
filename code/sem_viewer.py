@@ -33,7 +33,7 @@ from scipy.ndimage import map_coordinates
 from scipy.stats import pearsonr
 from .Junction_Analyser import JunctionAnalyzer
 from .perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles
-from .helper_gui import fit_perpendicular_profiles
+from .helper_gui import fit_perpendicular_profiles, fit_perpendicular_profiles_linear
 from .helper_gui import ask_junction_width, ask_junction_weight, draw_scalebar, safe_remove_colorbar
 from .ROI_extractor import extract_line_rectangle
 
@@ -172,8 +172,14 @@ class SEMViewer:
 
         # Fit Profiles button
         ax_fit = self.fig.add_axes([x_pos, y, button_w, button_h])
-        self.b_fit = Button(ax_fit, 'Fit Profiles')
+        self.b_fit = Button(ax_fit, 'Fit Profiles exp')
         self.b_fit.on_clicked(self._fit_profiles)
+        y -= (button_h + spacing)
+
+        # Fit Profiles lin button
+        ax_fit_lin = self.fig.add_axes([x_pos, y, button_w, button_h])
+        self.b_fit_lin = Button(ax_fit_lin, 'Fit Profiles lin')
+        self.b_fit_lin.on_clicked(self._fit_profiles_linear)
         y -= (button_h + spacing)
 
         # --- Junction Detection button ---
@@ -939,3 +945,6 @@ class SEMViewer:
     
     def _fit_profiles(self, event=None):
         fit_perpendicular_profiles(self)
+
+    def _fit_profiles_linear(self, event=None):
+        fit_perpendicular_profiles_linear(self)

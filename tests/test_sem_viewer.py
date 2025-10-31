@@ -154,3 +154,21 @@ def test_reset_overlays_and_on_close_creates_file(tmp_path):
         plt.close(viewer.fig)
     except Exception:
         pass
+    
+def test_semviewer_has_fit_lin_button(monkeypatch):
+    # ensure plt.show does nothing in the test
+    monkeypatch.setattr(plt, 'show', lambda *a, **k: None)
+
+    pixel = np.zeros((100, 150))
+    current = np.zeros((100, 150))
+    # current_maps expect a list where index 1 is the current frame
+    current_maps = [None, current]
+
+    sv = SEMViewer([pixel], current_maps, pixel_size=1e-6, sample_name='test')
+
+    # The button attribute should exist
+    assert hasattr(sv, 'b_fit_lin'), "SEMViewer missing 'b_fit_lin' attribute"
+    btn = getattr(sv, 'b_fit_lin')
+    # Button object should not be None and should have on_clicked method
+    assert btn is not None
+    assert hasattr(btn, 'on_clicked')

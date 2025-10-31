@@ -138,12 +138,27 @@ class DiffusionLengthExtractor:
         if intersection_idx is None:
             intersection_idx = base_idx
 
+        # allow overlap up to the profile maximum: permit the left-side start to
+        # move rightwards up to the profile peak (base_idx) and the right-side
+        # start to move leftwards down to the peak. This ensures we can begin
+        # fits closer to the true peak when the intersection is offset.
+        n = len(x_vals)
+        relative = int(base_idx - intersection_idx)
+        # positive allowed shift for left side (how far right we can go)
+        pos_allow = max(0, relative)
+        pos_allow = min(pos_allow, n - 1)
+        # negative allowed shift for right side (how far left we can go)
+        neg_allow = min(0, relative)
+        neg_allow = max(neg_allow, -(n - 1))
+
         results = []
         tolerance = self.pixel_size * 1e6
 
         # --- LEFT side: find start index ---
         prev_left_val, left_stable, best_left_idx = None, False, None
-        for shift in range(0, -16, -1):  # try shifts leftwards
+        # try shifts: allow starting to the right up to the peak (pos_allow),
+        # then move leftwards (negative shifts) to search for stable head.
+        for shift in range(pos_allow, -16, -1):
             if left_stable:
                 break
             start_idx_left = max(0, (intersection_idx if intersection_idx <= base_idx else base_idx) + shift)
@@ -172,7 +187,9 @@ class DiffusionLengthExtractor:
 
         # --- RIGHT side: find start index ---
         prev_right_val, right_stable, best_right_idx = None, False, None
-        for shift in range(0, 16):  # try shifts rightwards
+        # try shifts: allow starting to the left down to the peak (neg_allow),
+        # then move rightwards (positive shifts) to search for stable head.
+        for shift in range(neg_allow, 16):
             if right_stable:
                 break
             start_idx_right = min(len(x_vals) - 1,
@@ -982,3 +999,288 @@ class DiffusionLengthExtractor:
             inv_lambda_old_right = inv_right
 
         return results
+
+
+    
+
+    def _fit_linear(self, x, y, shift, side="Right", profile_id=0):
+        """
+        Fit a linear model to ln(y) vs x (natural log). Returns a dict similar
+        to _fit_falling but with slope/intercept and inv_lambda derived from the
+        slope (inv_lambda = 1/|slope| in µm units when x is in µm).
+        """
+        if len(x) < 3:
+            return None
+
+        # Ensure positive values for log; floor tiny or non-positive values
+        y_arr = np.array(y, dtype=float)
+        pos = y_arr[y_arr > 0]
+        if pos.size > 0:
+            floor = max(np.min(pos) * 0.1, 1e-12)
+        else:
+            floor = 1e-12
+        y_safe = np.maximum(y_arr, floor)
+
+        try:
+            # fit linear model to natural log
+            logy = np.log(y_safe)
+            p = np.polyfit(x, logy, 1)
+            slope = float(p[0])
+            intercept = float(p[1])
+            log_fit = np.polyval(p, x)
+            fit_curve = np.exp(log_fit)
+
+            # slope has units 1/µm (x in µm). inv_lambda in µm is 1/|slope|.
+            if slope == 0:
+                inv_lambda_um = np.inf
+            else:
+                inv_lambda_um = 1.0 / abs(slope)
+
+            pixel_size_um = self.pixel_size * 1e6
+            inv_lambda = inv_lambda_um
+            if np.isfinite(inv_lambda_um) and pixel_size_um > 0:
+                inv_lambda = max(round(inv_lambda_um / pixel_size_um) * pixel_size_um, pixel_size_um)
+
+            # compute R^2 on log-domain
+            ss_res = np.sum((logy - log_fit) ** 2)
+            ss_tot = np.sum((logy - np.mean(logy)) ** 2)
+            r2 = 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
+
+            return {
+                'side': f'{side} (shift {shift})',
+                'shift': shift,
+                'x_vals': x,
+                'y_vals': y,
+                'fit_curve': fit_curve,
+                'parameters': (slope, intercept),
+                'slope': slope,
+                'intercept': intercept,
+                'inv_lambda': inv_lambda,
+                'r2': r2
+            }
+        except Exception as e:
+            print(f"{side} linear fit failed (shift {shift}) for profile {profile_id}: {e}")
+            return None
+
+    def _truncate_tail_and_fit_linear(self, x, y, shift, side, profile_id=0):
+        """
+        Progressively truncate the tail and fit each case for linear-on-log fits.
+        """
+        results = []
+        n = len(x)
+        tolerance = self.pixel_size * 1e6
+        prev_val = None
+        stable_reached = False
+
+        for cut in range(n, max(3, n - 20), -1):
+            if stable_reached:
+                break
+
+            x_cut, y_cut = x[:cut], y[:cut]
+            if len(x_cut) < 3:
+                continue
+
+            fit = self._fit_linear(
+                x=x_cut, y=y_cut,
+                shift=shift,
+                side=f"{side}-tailcut{n - cut}",
+                profile_id=profile_id
+            )
+
+            if fit:
+                curr_val = fit.get('inv_lambda', None)
+                if curr_val is not None:
+                    if prev_val is not None and abs(curr_val - prev_val) <= tolerance:
+                        stable_reached = True
+                    prev_val = curr_val
+                    results.append(fit)
+
+        return results
+
+    def fit_profile_sides_linear(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
+                                 plot_left=True, plot_right=True):
+        """
+        Same flow as fit_profile_sides but fits linear models on ln(current) for
+        left and right sides. Uses the same shifting and tail-cut truncation logic.
+        """
+        x_vals = np.asarray(x_vals)
+        y_vals = np.asarray(y_vals)
+
+        base_idx = int(np.argmax(y_vals))
+        if intersection_idx is None:
+            intersection_idx = base_idx
+
+        results = []
+        tolerance = self.pixel_size * 1e6
+
+        # --- LEFT side: find start index ---
+        prev_left_val, left_stable, best_left_idx = None, False, None
+        for shift in range(0, -16, -1):  # try shifts leftwards
+            if left_stable:
+                break
+            start_idx_left = max(0, (intersection_idx if intersection_idx <= base_idx else base_idx) + shift)
+            left_x_raw = x_vals[:start_idx_left + 1]
+            y_left_raw = y_vals[:start_idx_left + 1]
+
+            y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
+            y_left_flipped = y_left_filtered[::-1]
+            x_left_flipped = np.abs(left_x_raw)[::-1]
+
+            cut_idx = self._find_snr_end_index(y_left_flipped)
+            left_y_truncated = y_left_flipped[:cut_idx]
+            left_x_truncated = x_left_flipped[:cut_idx]
+
+            if len(left_x_truncated) > 2:
+                left_fit = self._fit_linear(
+                    x=left_x_truncated, y=left_y_truncated,
+                    shift=shift, side="Left", profile_id=profile_id
+                )
+                if left_fit:
+                    curr_val = left_fit.get('inv_lambda', None)
+                    if curr_val is not None:
+                        if prev_left_val is not None and abs(curr_val - prev_left_val) <= tolerance:
+                            left_stable, best_left_idx = True, start_idx_left
+                        prev_left_val = curr_val
+
+        # --- RIGHT side: find start index ---
+        prev_right_val, right_stable, best_right_idx = None, False, None
+        for shift in range(0, 16):  # try shifts rightwards
+            if right_stable:
+                break
+            start_idx_right = min(len(x_vals) - 1,
+                                  (intersection_idx if intersection_idx >= base_idx else base_idx) + shift)
+            right_x_raw = x_vals[start_idx_right:]
+            y_right_raw = y_vals[start_idx_right:]
+
+            y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
+            cut_idx = self._find_snr_end_index(y_right_filtered)
+            right_y_truncated = y_right_filtered[:cut_idx]
+            right_x_truncated = right_x_raw[:cut_idx]
+
+            if len(right_x_truncated) > 2:
+                right_fit = self._fit_linear(
+                    x=right_x_truncated, y=right_y_truncated,
+                    shift=shift, side="Right", profile_id=profile_id
+                )
+                if right_fit:
+                    curr_val = right_fit.get('inv_lambda', None)
+                    if curr_val is not None:
+                        if prev_right_val is not None and abs(curr_val - prev_right_val) <= tolerance:
+                            right_stable, best_right_idx = True, start_idx_right
+                        prev_right_val = curr_val
+
+        # --- Tail truncations with fixed start indices ---
+        if best_left_idx is not None:
+            left_x_raw = x_vals[:best_left_idx + 1]
+            y_left_raw = y_vals[:best_left_idx + 1]
+            y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
+            y_left_flipped = y_left_filtered[::-1]
+            x_left_flipped = np.abs(left_x_raw)[::-1]
+
+            cut_idx = self._find_snr_end_index(y_left_flipped)
+            left_y_truncated = y_left_flipped[:cut_idx]
+            left_x_truncated = x_left_flipped[:cut_idx]
+
+            results.extend(self._truncate_tail_and_fit_linear(
+                left_x_truncated, left_y_truncated,
+                shift=0, side="Left", profile_id=profile_id
+            ))
+
+        if best_right_idx is not None:
+            right_x_raw = x_vals[best_right_idx:]
+            y_right_raw = y_vals[best_right_idx:]
+            y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
+
+            cut_idx = self._find_snr_end_index(y_right_filtered)
+            right_y_truncated = y_right_filtered[:cut_idx]
+            right_x_truncated = right_x_raw[:cut_idx]
+
+            results.extend(self._truncate_tail_and_fit_linear(
+                right_x_truncated, right_y_truncated,
+                shift=0, side="Right", profile_id=profile_id
+            ))
+
+        # --- Visualization: only tail truncations ---
+        if plot_left and best_left_idx is not None:
+            self._plot_tailcut_fits(results, x_vals, y_vals, 'Left', base_idx, profile_id)
+        if plot_right and best_right_idx is not None:
+            self._plot_tailcut_fits(results, x_vals, y_vals, 'Right', base_idx, profile_id)
+
+        return results
+
+    def fit_profile_sides_iterative_linear(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
+                                           plot_left=True, plot_right=True, max_iter=10, tol_factor=1.0):
+        """
+        Iterative linear-on-log version of fit_profile_sides_iterative.
+        """
+        x_vals = np.asarray(x_vals)
+        y_vals = np.asarray(y_vals)
+
+        inv_lambda_old_left = None
+        inv_lambda_old_right = None
+        results = []
+
+        for iteration in range(max_iter):
+            results = self.fit_profile_sides_linear(
+                x_vals, y_vals,
+                intersection_idx=intersection_idx,
+                profile_id=profile_id,
+                plot_left=plot_left,
+                plot_right=plot_right
+            )
+
+            inv_left = [r['inv_lambda'] for r in results if "Left-tailcut" in r['side']]
+            inv_right = [r['inv_lambda'] for r in results if "Right-tailcut" in r['side']]
+
+            inv_left = inv_left[-1] if inv_left else None
+            inv_right = inv_right[-1] if inv_right else None
+
+            converged_left = (
+                inv_left is not None
+                and inv_lambda_old_left is not None
+                and abs(inv_left - inv_lambda_old_left) <= self.pixel_size * tol_factor
+            )
+            converged_right = (
+                inv_right is not None
+                and inv_lambda_old_right is not None
+                and abs(inv_right - inv_lambda_old_right) <= self.pixel_size * tol_factor
+            )
+
+            if converged_left and converged_right:
+                print(f"Profile {profile_id}: linear fits converged after {iteration+1} iterations.")
+                break
+
+            inv_lambda_old_left = inv_left
+            inv_lambda_old_right = inv_right
+
+        return results
+
+    def fit_all_profiles_linear(self):
+        """
+        Run linear-on-log fitting for all loaded profiles and populate self.results
+        similarly to fit_all_profiles.
+        """
+        self.results = []
+        self.inv_lambdas = []
+        self.central_inv_lambdas = []
+
+        for i, prof in enumerate(self.profiles):
+            intersection_idx = prof.get('intersection_idx', None)
+            x_vals = np.array(prof['dist_um'])
+            y_vals = np.array(prof['current'])
+
+            sides = self.fit_profile_sides_iterative_linear(
+                x_vals, y_vals,
+                intersection_idx=intersection_idx,
+                profile_id=i + 1
+            )
+
+            depletion_info = self._extract_depletion_region(
+                sides, x_vals, np.argmax(y_vals)
+            )
+
+            self.results.append({
+                'Profile': i + 1,
+                'fit_sides': sides,
+                'depletion': depletion_info
+            })
