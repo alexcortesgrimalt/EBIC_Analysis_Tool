@@ -496,11 +496,12 @@ def generate_perpendicular_profiles(viewer, num_lines, length_um):
         length_um,
         viewer.pixel_maps[0], 
         viewer.current_maps[1],
-        detected_junction=getattr(viewer, 'detected_junction_line', None)
+        detected_junction=getattr(viewer, 'detected_junction_line', None),
+        source_name=getattr(viewer, 'sample_name', None)
     )
     
     viewer.perpendicular_profiles = profiles
-    plot_perpendicular_profiles(profiles, ax=viewer.ax, fig=viewer.fig)
+    plot_perpendicular_profiles(profiles, ax=viewer.ax, fig=viewer.fig, source_name=getattr(viewer, 'sample_name', None))
     # Also save log(EBIC) vs distance plots for the generated perpendicular profiles
     try:
         pixel_size = getattr(viewer, 'pixel_size', 1e-6)

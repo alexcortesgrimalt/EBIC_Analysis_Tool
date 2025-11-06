@@ -237,7 +237,7 @@ class DiffusionLengthExtractor:
         # return results
     
     def fit_profile_sides(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
-                          plot_left=True, plot_right=True, prevent_cross_peak=False):
+                          plot_left=False, plot_right=False, prevent_cross_peak=False):
         """
         Fit falling exponentials on both sides:
         1. Find the correct starting point by shifting until 1/λ stabilizes.
@@ -252,22 +252,12 @@ class DiffusionLengthExtractor:
         if intersection_idx is None:
             intersection_idx = base_idx
 
-
-        n = len(x_vals)
-        relative = int(base_idx - intersection_idx)
-
-        pos_allow = max(0, relative)
-        pos_allow = min(pos_allow, n - 1)
-
-        neg_allow = min(0, relative)
-        neg_allow = max(neg_allow, -(n - 1))
-
         results = []
         tolerance = self.pixel_size * 1e6
 
         prev_left_val, left_stable, best_left_idx = None, False, None
         left_candidates = []
-        for shift in np.arange(0, -21, -1):
+        for shift in np.arange(0, -11, -1):
             print(f"Trying left shift: {shift}")
             if left_stable:
                 break
@@ -311,7 +301,7 @@ class DiffusionLengthExtractor:
         prev_right_val, right_stable, best_right_idx = None, False, None
         right_candidates = []
 
-        for shift in range(0, 21, 1):
+        for shift in range(0, 11, 1):
             if right_stable:
                 break
             start_idx_right = min(len(x_vals) - 1, base_idx + shift)
@@ -353,6 +343,31 @@ class DiffusionLengthExtractor:
         best_right_idx = None
         if right_candidates:
             best_right_idx = max(right_candidates, key=lambda t: t[1].get('r2', -np.inf))[0]
+
+        # --- Choose best candidates by R² (and enforce side-start sign) ---
+        best_left_idx = None
+        if left_candidates:
+            ref = float(x_vals[base_idx])
+            # prefer candidates whose start position is on the left side (<= ref)
+            left_filtered = [(idx, f) for idx, f in left_candidates if float(x_vals[idx]) - ref <= 0]
+            if left_filtered:
+                best_left_idx = max(left_filtered, key=lambda t: t[1].get('r2', -np.inf))[0]
+            else:
+                # fallback: pick best overall but ensure it doesn't lie right of peak
+                cand = max(left_candidates, key=lambda t: t[1].get('r2', -np.inf))
+                if float(x_vals[cand[0]]) - ref <= 0:
+                    best_left_idx = cand[0]
+
+        best_right_idx = None
+        if right_candidates:
+            ref = float(x_vals[base_idx])
+            right_filtered = [(idx, f) for idx, f in right_candidates if float(x_vals[idx]) - ref >= 0]
+            if right_filtered:
+                best_right_idx = max(right_filtered, key=lambda t: t[1].get('r2', -np.inf))[0]
+            else:
+                cand = max(right_candidates, key=lambda t: t[1].get('r2', -np.inf))
+                if float(x_vals[cand[0]]) - ref >= 0:
+                    best_right_idx = cand[0]
 
         # --- Tail truncations with fixed start indices ---
         if best_left_idx is not None:
@@ -1385,58 +1400,105 @@ class DiffusionLengthExtractor:
         y_safe = np.maximum(y_arr, floor)
 
         try:
-            # fit linear model to natural log
+            # Default behavior: log-transform inside this routine for callers
+            # that pass raw y. Keep existing semantics.
             logy = np.log(y_safe)
+            return self._fit_linear_on_log(x, logy, shift=shift, side=side, profile_id=profile_id)
+        except Exception as e:
+            print(f"{side} linear fit failed (shift {shift}) for profile {profile_id}: {e}")
+            return None
 
-            # For left-side fits we want the slope to be positive when the
-            # signal falls away from the intersection. Internally we fit
-            # against a signed x-axis: invert x for left fits so that the
-            # returned slope follows the test's sign convention. We still
-            # store `x_vals` as the positive distances measured from the
-            # fitting side so plotting logic remains unchanged.
+    def _fit_linear_on_log(self, x, logy, shift, side="Right", profile_id=0, baseline=0.0):
+        """
+        Fit a linear model to precomputed natural-log values `logy`.
+        Returns a dict with fit parameters, R², and fitted curve.
+        """
+        try:
+            # Ensure arrays
             x_arr = np.array(x, dtype=float)
-            if 'Left' in side:
-                x_for_fit = -x_arr
-            else:
-                x_for_fit = x_arr
+            logy_arr = np.array(logy, dtype=float)
 
-            p = np.polyfit(x_for_fit, logy, 1)
+            # The executable contract used elsewhere: `x_vals` returned by
+            # fitting routines are the local positive distances from the
+            # fitting edge (0..). For the left side callers often pass a
+            # flipped/positive-distance x already; ensure we keep that
+            # convention here. We'll also flip for fitting to keep a
+            # consistent increasing-x fit direction, and then flip back for
+            # construction of fit_curve_local.
+            # Determine whether the input x_arr is already local-positive
+            # distances (starts at 0); we treat x_arr as the local domain.
+
+            # For fitting consistency, flip the x-axis for left-side fits
+            # so the polynomial sees increasing distances from the edge.
+            if 'Left' in side:
+                x_for_fit = -np.array(x_arr, dtype=float)
+            else:
+                x_for_fit = np.array(x_arr, dtype=float)
+
+            # Linear fit in log-domain (slope, intercept)
+            p = np.polyfit(x_for_fit, logy_arr, 1)
             slope = float(p[0])
             intercept = float(p[1])
-            log_fit = np.polyval(p, x_for_fit)
-            fit_curve = np.exp(log_fit)
 
-            # slope has units 1/µm (x in µm). inv_lambda in µm is 1/|slope|.
-            if slope == 0:
-                inv_lambda_um = np.inf
+            # Evaluate fitted line in the fit domain (x_for_fit) and map
+            # back to the returned local x ordering (x_arr). For left side
+            # we fitted on -x_arr, so evaluate on -x_for_fit to get values
+            # aligned with x_arr.
+            if 'Left' in side:
+                # x_for_fit == -x_arr, so -x_for_fit == x_arr
+                log_fit = np.polyval(p, -x_for_fit)
             else:
-                inv_lambda_um = 1.0 / abs(slope)
+                log_fit = np.polyval(p, x_for_fit)
 
+            # Reconstruct fitted curve in original units by adding the
+            # baseline back (we assume logy = log(y - baseline)). Keep a
+            # local copy (`fit_curve_local`) that is elementwise aligned
+            # with `x_vals` (local distances). Callers may later compute a
+            # `fit_curve` mapped to `global_x_vals` depending on mapping.
+            fit_curve_local = np.exp(log_fit) + float(baseline)
+
+            # Characteristic length: slope is d(ln y)/dx, so 1/|slope| in
+            # the x-units (which here are µm when used as such). Convert
+            # and quantize to pixel size for reporting, matching other
+            # routines' behavior.
+            inv_lambda_um = np.inf if slope == 0 else 1.0 / abs(slope)
             pixel_size_um = self.pixel_size * 1e6
-            inv_lambda = inv_lambda_um
             if np.isfinite(inv_lambda_um) and pixel_size_um > 0:
                 inv_lambda = max(round(inv_lambda_um / pixel_size_um) * pixel_size_um, pixel_size_um)
+            else:
+                inv_lambda = inv_lambda_um
 
-            # compute R^2 on log-domain
-            ss_res = np.sum((logy - log_fit) ** 2)
-            ss_tot = np.sum((logy - np.mean(logy)) ** 2)
+            # Compute R² in log-domain (consistent with linear fit)
+            ss_res = np.sum((logy_arr - log_fit) ** 2)
+            ss_tot = np.sum((logy_arr - np.mean(logy_arr)) ** 2)
             r2 = 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
 
+            # Return a dict that mirrors the exponential fitter's keys so
+            # downstream code can consume results uniformly. Note:
+            # - 'x_vals' is the local distances array (as provided)
+            # - 'y_vals' is reconstructed raw-domain values (exp(logy)+baseline)
+            # - 'fit_curve' is set to fit_curve_local here; callers that
+            #   attach 'global_x_vals' and need the fit mapped to global
+            #   coordinates will recompute a mapped fit later (truncate
+            #   helpers already do this).
             return {
                 'side': f'{side} (shift {shift})',
                 'shift': shift,
-                'x_vals': x,
-                'y_vals': y,
-                'fit_curve': fit_curve,
+                'x_vals': np.array(x_arr, dtype=float),
+                'y_vals': np.exp(logy_arr) + float(baseline),
+                'fit_curve': fit_curve_local,
+                'fit_curve_local': fit_curve_local,
                 'parameters': (slope, intercept),
                 'slope': slope,
                 'intercept': intercept,
                 'inv_lambda': inv_lambda,
                 'r2': r2
             }
+
         except Exception as e:
-            print(f"{side} linear fit failed (shift {shift}) for profile {profile_id}: {e}")
+            print(f"{side} linear(on-log) fit failed (shift {shift}) for profile {profile_id}: {e}")
             return None
+
 
     def _truncate_tail_and_fit_linear(self, x, y, shift, side, profile_id=0, global_x=None,
                                       prevent_cross_peak=False, ref=None):
@@ -1457,8 +1519,19 @@ class DiffusionLengthExtractor:
             if len(x_cut) < 3:
                 continue
 
-            fit = self._fit_linear(
-                x=x_cut, y=y_cut,
+            # Pre-log the y data here so the linear fit operates on ln(y)
+            # consistently with the requested behavior.
+            y_arr = np.array(y[:cut], dtype=float)
+            pos = y_arr[y_arr > 0]
+            if pos.size > 0:
+                floor = max(np.min(pos) * 0.1, 1e-12)
+            else:
+                floor = 1e-12
+            y_safe = np.maximum(y_arr, floor)
+            logy = np.log(y_safe)
+
+            fit = self._fit_linear_on_log(
+                x=x_cut, logy=logy,
                 shift=shift,
                 side=f"{side}-tailcut{n - cut}",
                 profile_id=profile_id
@@ -1543,14 +1616,15 @@ class DiffusionLengthExtractor:
         tolerance = self.pixel_size * 1e6
 
         # --- LEFT side: find start index ---
-        prev_left_val, left_stable, best_left_idx = None, False, None
-        for shift in range(pos_allow, -16, -1):  # try shifts leftwards (allow rightwards up to peak)
-            if left_stable:
-                break
-            # Anchor the left start search at the profile peak so the left
-            # start can attempt to reach the maximum peak regardless of
-            # the provided intersection index.
-            start_idx_left = max(0, base_idx + shift)
+        # We'll try a broader shift range and collect candidate fits. We
+        # prefer starting indices that are <= base_idx so the left start is
+        # never to the right of the peak. We transform y to ln(y) before
+        # fitting so the curve fit is linear in the log-domain.
+        left_candidates = []
+        max_shift = min(max(30, n // 4), n - 1)
+        for shift in range(pos_allow, -max_shift - 1, -1):
+            # clamp start index so it never lies to the right of the peak
+            start_idx_left = max(0, min(base_idx, base_idx + shift))
             left_x_raw = x_vals[:start_idx_left + 1]
             y_left_raw = y_vals[:start_idx_left + 1]
 
@@ -1567,43 +1641,88 @@ class DiffusionLengthExtractor:
             left_x_truncated = x_left_flipped[:cut_idx]
 
             if len(left_x_truncated) > 2:
-                left_fit = self._fit_linear(
-                    x=left_x_truncated, y=left_y_truncated,
-                    shift=shift, side="Left", profile_id=profile_id
+                # pre-log the truncated data for linear fitting
+                y_arr = np.array(left_y_truncated, dtype=float)
+                # estimate baseline from tail median of the truncated segment
+                tail_n = min(10, max(3, len(y_arr) // 5))
+                baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
+                # subtract baseline then floor small/negative residuals
+                y_corr = y_arr - baseline
+                pos = y_corr[y_corr > 0]
+                if pos.size > 0:
+                    # use a small fraction for floor to avoid changing shape
+                    floor = max(np.min(pos) * 1e-6, 1e-12)
+                else:
+                    floor = 1e-12
+                logy = np.log(np.maximum(y_corr, floor))
+
+                left_fit = self._fit_linear_on_log(
+                    x=left_x_truncated, logy=logy,
+                    shift=shift, side="Left", profile_id=profile_id,
+                    baseline=baseline
                 )
-                if left_fit:
-                    curr_val = left_fit.get('inv_lambda', None)
-                    if curr_val is not None:
-                        if prev_left_val is not None and abs(curr_val - prev_left_val) <= tolerance:
-                            left_stable, best_left_idx = True, start_idx_left
-                        prev_left_val = curr_val
+                if left_fit and left_fit.get('r2') is not None:
+                    left_candidates.append((start_idx_left, left_fit))
 
         # --- RIGHT side: find start index ---
-        prev_right_val, right_stable, best_right_idx = None, False, None
-        for shift in range(neg_allow, 16):  # try shifts rightwards (allow leftwards down to peak)
-            if right_stable:
-                break
-            # Anchor the right start at the profile peak as well for symmetry.
-            start_idx_right = min(len(x_vals) - 1, base_idx + shift)
+        right_candidates = []
+        for shift in range(neg_allow, max_shift + 1):  # try a broader rightward shift
+            start_idx_right = min(len(x_vals) - 1, max(base_idx, base_idx + shift))
             right_x_raw = x_vals[start_idx_right:]
             y_right_raw = y_vals[start_idx_right:]
 
             y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
             cut_idx = self._find_snr_end_index(y_right_filtered)
             right_y_truncated = y_right_filtered[:cut_idx]
-            right_x_truncated = right_x_raw[:cut_idx]
+            try:
+                start_pos_right = float(right_x_raw[0])
+                right_x_truncated = (np.array(right_x_raw, dtype=float) - start_pos_right)[:cut_idx]
+            except Exception:
+                right_x_truncated = right_x_raw[:cut_idx]
 
             if len(right_x_truncated) > 2:
-                right_fit = self._fit_linear(
-                    x=right_x_truncated, y=right_y_truncated,
-                    shift=shift, side="Right", profile_id=profile_id
+                y_arr = np.array(right_y_truncated, dtype=float)
+                tail_n = min(10, max(3, len(y_arr) // 5))
+                baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
+                y_corr = y_arr - baseline
+                pos = y_corr[y_corr > 0]
+                if pos.size > 0:
+                    floor = max(np.min(pos) * 1e-6, 1e-12)
+                else:
+                    floor = 1e-12
+                logy = np.log(np.maximum(y_corr, floor))
+
+                right_fit = self._fit_linear_on_log(
+                    x=right_x_truncated, logy=logy,
+                    shift=shift, side="Right", profile_id=profile_id,
+                    baseline=baseline
                 )
-                if right_fit:
-                    curr_val = right_fit.get('inv_lambda', None)
-                    if curr_val is not None:
-                        if prev_right_val is not None and abs(curr_val - prev_right_val) <= tolerance:
-                            right_stable, best_right_idx = True, start_idx_right
-                        prev_right_val = curr_val
+                if right_fit and right_fit.get('r2') is not None:
+                    right_candidates.append((start_idx_right, right_fit))
+
+        # --- Choose best candidates by R² (and enforce side-start sign) ---
+        best_left_idx = None
+        if left_candidates:
+            ref = float(x_vals[base_idx])
+            # prefer candidates whose start position is on the left side (<= ref)
+            left_filtered = [(idx, f) for idx, f in left_candidates if float(x_vals[idx]) - ref <= 0]
+            if left_filtered:
+                best_left_idx = max(left_filtered, key=lambda t: t[1].get('r2', -np.inf))[0]
+            else:
+                cand = max(left_candidates, key=lambda t: t[1].get('r2', -np.inf))
+                if float(x_vals[cand[0]]) - ref <= 0:
+                    best_left_idx = cand[0]
+
+        best_right_idx = None
+        if right_candidates:
+            ref = float(x_vals[base_idx])
+            right_filtered = [(idx, f) for idx, f in right_candidates if float(x_vals[idx]) - ref >= 0]
+            if right_filtered:
+                best_right_idx = max(right_filtered, key=lambda t: t[1].get('r2', -np.inf))[0]
+            else:
+                cand = max(right_candidates, key=lambda t: t[1].get('r2', -np.inf))
+                if float(x_vals[cand[0]]) - ref >= 0:
+                    best_right_idx = cand[0]
 
         # --- Tail truncations with fixed start indices ---
         if best_left_idx is not None:
