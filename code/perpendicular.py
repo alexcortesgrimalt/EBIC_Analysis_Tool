@@ -2,6 +2,9 @@
 import numpy as np
 from scipy.ndimage import map_coordinates
 import matplotlib.pyplot as plt
+import tkinter as tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import os
 
 def calculate_perpendicular_profiles(line_coords, num_lines, length_um,
                                      sem_data, current_data,
@@ -88,10 +91,6 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None):
                 ax.scatter(inter[0], inter[1], color='lime', s=50, marker='x', zorder=20)
         fig.canvas.draw_idle()
 
-    # Plot each perpendicular profile
-    import tkinter as tk
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    import os
     win = tk.Toplevel()
     win.title("Perpendicular Profiles")
     win.geometry("1200x800")
@@ -108,8 +107,6 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None):
         sem_vals = prof["sem"]
         cur_vals = prof["current"]
         sem_vals_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals)+1e-12)
-        # Create a 2-row plot: top = SEM (normalized) + Current (linear) via twin y,
-        # bottom = log10(Current)
         fig_prof, (ax1, ax_log) = plt.subplots(2, 1, sharex=True, figsize=(6, 5), gridspec_kw={'height_ratios': [1, 1]})
         ax1.plot(dist_um, sem_vals_norm, color='tab:blue', linewidth=2, label='SEM (norm)')
 

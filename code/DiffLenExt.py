@@ -122,6 +122,120 @@ class DiffusionLengthExtractor:
         ss_tot = np.sum((y - np.mean(y)) ** 2)
         return 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
 
+    # def fit_profile_sides(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
+        #                   plot_left=True, plot_right=True):
+        # """
+        # Fit falling exponentials on both sides:
+        # 1. Find the correct starting point by shifting until 1/λ stabilizes.
+        # 2. With the starting point fixed, progressively truncate the tail
+        #    and fit each case.
+        # 3. Visualize only the tail truncation results.
+        # """
+        # x_vals = np.asarray(x_vals)
+        # y_vals = np.asarray(y_vals)
+
+        # base_idx = int(np.argmax(y_vals))
+        # if intersection_idx is None:
+        #     intersection_idx = base_idx
+
+        # results = []
+        # tolerance = self.pixel_size * 1e6
+
+        # # --- LEFT side: find start index ---
+        # prev_left_val, left_stable, best_left_idx = None, False, None
+        # for shift in range(0, -16, -1):  # try shifts leftwards
+        #     if left_stable:
+        #         break
+        #     start_idx_left = max(0, (intersection_idx if intersection_idx <= base_idx else base_idx) + shift)
+        #     left_x_raw = x_vals[:start_idx_left + 1]
+        #     y_left_raw = y_vals[:start_idx_left + 1]
+
+        #     y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
+        #     y_left_flipped = y_left_filtered[::-1]
+        #     x_left_flipped = np.abs(left_x_raw)[::-1]
+
+        #     cut_idx = self._find_snr_end_index(y_left_flipped)
+        #     left_y_truncated = y_left_flipped[:cut_idx]
+        #     left_x_truncated = x_left_flipped[:cut_idx]
+
+        #     if len(left_x_truncated) > 2:
+        #         left_fit = self._fit_falling(
+        #             x=left_x_truncated, y=left_y_truncated,
+        #             shift=shift, side="Left", profile_id=profile_id
+        #         )
+        #         if left_fit:
+        #             curr_val = left_fit.get('inv_lambda', None)
+        #             if curr_val is not None:
+        #                 if prev_left_val is not None and abs(curr_val - prev_left_val) <= tolerance:
+        #                     left_stable, best_left_idx = True, start_idx_left
+        #                 prev_left_val = curr_val
+
+        # # --- RIGHT side: find start index ---
+        # prev_right_val, right_stable, best_right_idx = None, False, None
+        # for shift in range(0, 16):  # try shifts rightwards
+        #     if right_stable:
+        #         break
+        #     start_idx_right = min(len(x_vals) - 1,
+        #                           (intersection_idx if intersection_idx >= base_idx else base_idx) + shift)
+        #     right_x_raw = x_vals[start_idx_right:]
+        #     y_right_raw = y_vals[start_idx_right:]
+
+        #     y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
+        #     cut_idx = self._find_snr_end_index(y_right_filtered)
+        #     right_y_truncated = y_right_filtered[:cut_idx]
+        #     right_x_truncated = right_x_raw[:cut_idx]
+
+        #     if len(right_x_truncated) > 2:
+        #         right_fit = self._fit_falling(
+        #             x=right_x_truncated, y=right_y_truncated,
+        #             shift=shift, side="Right", profile_id=profile_id
+        #         )
+        #         if right_fit:
+        #             curr_val = right_fit.get('inv_lambda', None)
+        #             if curr_val is not None:
+        #                 if prev_right_val is not None and abs(curr_val - prev_right_val) <= tolerance:
+        #                     right_stable, best_right_idx = True, start_idx_right
+        #                 prev_right_val = curr_val
+
+        # # --- Tail truncations with fixed start indices ---
+        # if best_left_idx is not None:
+        #     left_x_raw = x_vals[:best_left_idx + 1]
+        #     y_left_raw = y_vals[:best_left_idx + 1]
+        #     y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
+        #     y_left_flipped = y_left_filtered[::-1]
+        #     x_left_flipped = np.abs(left_x_raw)[::-1]
+
+        #     cut_idx = self._find_snr_end_index(y_left_flipped)
+        #     left_y_truncated = y_left_flipped[:cut_idx]
+        #     left_x_truncated = x_left_flipped[:cut_idx]
+
+        #     results.extend(self._truncate_tail_and_fit(
+        #         left_x_truncated, left_y_truncated,
+        #         shift=0, side="Left", profile_id=profile_id
+        #     ))
+
+        # if best_right_idx is not None:
+        #     right_x_raw = x_vals[best_right_idx:]
+        #     y_right_raw = y_vals[best_right_idx:]
+        #     y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
+
+        #     cut_idx = self._find_snr_end_index(y_right_filtered)
+        #     right_y_truncated = y_right_filtered[:cut_idx]
+        #     right_x_truncated = right_x_raw[:cut_idx]
+
+        #     results.extend(self._truncate_tail_and_fit(
+        #         right_x_truncated, right_y_truncated,
+        #         shift=0, side="Right", profile_id=profile_id
+        #     ))
+
+        # # --- Visualization: only tail truncations ---
+        # if plot_left and best_left_idx is not None:
+        #     self._plot_tailcut_fits(results, x_vals, y_vals, 'Left', base_idx, profile_id)
+        # if plot_right and best_right_idx is not None:
+        #     self._plot_tailcut_fits(results, x_vals, y_vals, 'Right', base_idx, profile_id)
+
+        # return results
+    
     def fit_profile_sides(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
                           plot_left=True, plot_right=True, prevent_cross_peak=False):
         """
@@ -138,40 +252,33 @@ class DiffusionLengthExtractor:
         if intersection_idx is None:
             intersection_idx = base_idx
 
-        # allow overlap up to the profile maximum: permit the left-side start to
-        # move rightwards up to the profile peak (base_idx) and the right-side
-        # start to move leftwards down to the peak. This ensures we can begin
-        # fits closer to the true peak when the intersection is offset.
+
         n = len(x_vals)
         relative = int(base_idx - intersection_idx)
-        # positive allowed shift for left side (how far right we can go)
+
         pos_allow = max(0, relative)
         pos_allow = min(pos_allow, n - 1)
-        # negative allowed shift for right side (how far left we can go)
+
         neg_allow = min(0, relative)
         neg_allow = max(neg_allow, -(n - 1))
 
         results = []
         tolerance = self.pixel_size * 1e6
 
-        # --- LEFT side: find start index ---
         prev_left_val, left_stable, best_left_idx = None, False, None
-        # try shifts: allow starting to the right up to the peak (pos_allow),
-        # then move leftwards (negative shifts) to search for stable head.
-        for shift in range(pos_allow, -16, -1):
+        left_candidates = []
+        for shift in np.arange(0, -21, -1):
+            print(f"Trying left shift: {shift}")
             if left_stable:
                 break
-            # Anchor the left start search at the profile peak so we can always
-            # try starting as far right as the peak regardless of the provided
-            # intersection index. The `shift` then moves leftwards from there.
+
             start_idx_left = max(0, base_idx + shift)
             left_x_raw = x_vals[:start_idx_left + 1]
             y_left_raw = y_vals[:start_idx_left + 1]
 
             y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
             y_left_flipped = y_left_filtered[::-1]
-            # compute local distances measured from the fit start (closest to peak)
-            # so the first element is 0.0 and distances increase away from the intersection
+
             try:
                 start_pos_left = float(left_x_raw[-1])
                 x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
@@ -189,20 +296,24 @@ class DiffusionLengthExtractor:
                 )
                 if left_fit:
                     curr_val = left_fit.get('inv_lambda', None)
+                    try:
+                        left_candidates.append((start_idx_left, left_fit))
+                    except Exception:
+                        pass
                     if curr_val is not None:
-                        if prev_left_val is not None and abs(curr_val - prev_left_val) <= tolerance:
-                            left_stable, best_left_idx = True, start_idx_left
+                        if (prev_left_val is not None
+                        and abs(curr_val - prev_left_val) <= tolerance):
+                            left_stable, best_left_idx = False, start_idx_left
                         prev_left_val = curr_val
 
-        # --- RIGHT side: find start index ---
+
+
         prev_right_val, right_stable, best_right_idx = None, False, None
-        # try shifts: allow starting to the left down to the peak (neg_allow),
-        # then move rightwards (positive shifts) to search for stable head.
-        for shift in range(neg_allow, 16):
+        right_candidates = []
+
+        for shift in range(0, 21, 1):
             if right_stable:
                 break
-            # Anchor the right start search at the profile peak so we can try
-            # moving the right-side start leftwards down to the peak.
             start_idx_right = min(len(x_vals) - 1, base_idx + shift)
             right_x_raw = x_vals[start_idx_right:]
             y_right_raw = y_vals[start_idx_right:]
@@ -210,7 +321,6 @@ class DiffusionLengthExtractor:
             y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
             cut_idx = self._find_snr_end_index(y_right_filtered)
             right_y_truncated = y_right_filtered[:cut_idx]
-            # compute local distances from the fit start (first element)
             try:
                 start_pos_right = float(right_x_raw[0])
                 right_x_local = np.array(right_x_raw, dtype=float) - start_pos_right
@@ -225,9 +335,13 @@ class DiffusionLengthExtractor:
                 )
                 if right_fit:
                     curr_val = right_fit.get('inv_lambda', None)
+                    try:
+                        right_candidates.append((start_idx_right, right_fit))
+                    except Exception:
+                        pass
                     if curr_val is not None:
                         if prev_right_val is not None and abs(curr_val - prev_right_val) <= tolerance:
-                            right_stable, best_right_idx = True, start_idx_right
+                            right_stable, best_right_idx = False, start_idx_right
                         prev_right_val = curr_val
 
         # --- Choose best candidates by R² (if any) and then do tail truncations ---

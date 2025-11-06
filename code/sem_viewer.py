@@ -27,7 +27,7 @@ if not _has_tk:
 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.widgets import Button
+from matplotlib.widgets import Button, Slider, TextBox
 import matplotlib.patches as patches
 from scipy.ndimage import map_coordinates
 from scipy.stats import pearsonr
@@ -71,6 +71,15 @@ class SEMViewer:
         self.junction_line = None  # Line2D object for manual line
         self.junction_coords = None  # Start/end coords of manual line
         self.junction_position = None  # Detected junction (x, y) along line
+        # EBIC weight used by JunctionAnalyzer (default 10.0)
+        self.ebic_weight = 10.0
+        # Internal state to allow re-running detection when weight changes
+        self._last_roi = None
+        self._last_roi_current = None
+        self._last_manual_line_dense = None
+        self._last_half_width_px = None
+        # flag used to avoid recursion when syncing slider/textbox
+        self._weight_update_in_progress = False
 
         # DPI and figure size to match the first frame
         width_px, height_px = self.frame_sizes[0]
@@ -170,6 +179,22 @@ class SEMViewer:
         self.zoom_btn = Button(ax_zoom, 'Zoom')
         self.zoom_btn.on_clicked(self.enable_zoom)
 
+        # EBIC weight slider (controls weight used in junction detection)
+        # Place it just above the zoom button area
+        slider_h = 0.03
+        slider_y = 0.01 + button_h + spacing
+        ax_weight = self.fig.add_axes([x_pos, slider_y, button_w, slider_h])
+        # Slider range: 0.1 .. 100.0, default self.ebic_weight
+        self.weight_slider = Slider(ax_weight, 'EBIC weight', 0.1, 100.0, valinit=self.ebic_weight)
+        self.weight_slider.on_changed(self._on_weight_slider_change)
+        # Small textbox to the right so user can type an exact value
+        textbox_w = 0.04
+        textbox_x = x_pos + button_w + 0.005
+        ax_weight_val = self.fig.add_axes([textbox_x, slider_y, textbox_w, slider_h])
+        # TextBox initial value is the numeric value of ebic_weight
+        self.weight_textbox = TextBox(ax_weight_val, '', initial=str(self.ebic_weight))
+        self.weight_textbox.on_submit(self._on_weight_text_submit)
+
         # Fit Profiles button
         ax_fit = self.fig.add_axes([x_pos, y, button_w, button_h])
         self.b_fit = Button(ax_fit, 'Fit Profiles exp')
@@ -191,6 +216,57 @@ class SEMViewer:
 
         # Connect close event
         self.fig.canvas.mpl_connect('close_event', self._on_close)
+
+    def _on_weight_slider_change(self, val):
+        """Callback when the EBIC weight slider changes."""
+        try:
+            self.ebic_weight = float(val)
+            # Provide quick user feedback
+            print(f"EBIC weight set to {self.ebic_weight}")
+
+            # Update textbox if present to reflect the new numeric value
+            try:
+                if hasattr(self, 'weight_textbox') and self.weight_textbox is not None:
+                    # Update displayed text without triggering the textbox callback
+                    try:
+                        # TextBox.text_disp is the Text artist showing the value
+                        self.weight_textbox.text_disp.set_text(str(self.ebic_weight))
+                        # redraw canvas so change is visible
+                        if hasattr(self, 'fig') and self.fig is not None:
+                            self.fig.canvas.draw_idle()
+                    except Exception:
+                        # fallback to set_val if text_disp not available
+                        try:
+                            self.weight_textbox.set_val(str(self.ebic_weight))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Note: Do NOT re-run detection on every slider move; detection is triggered
+            # only when the user presses the 'Junction Detect' button.
+        except Exception:
+            # ignore invalid values
+            pass
+
+    def _on_weight_text_submit(self, text):
+        """Callback when user types a value into the EBIC weight textbox and presses Enter."""
+        try:
+            val = float(text)
+        except Exception:
+            # ignore invalid input
+            return
+
+        # Clamp to slider range if available
+        try:
+            if hasattr(self, 'weight_slider') and self.weight_slider is not None:
+                val = max(self.weight_slider.valmin, min(self.weight_slider.valmax, val))
+                # Setting slider value will call _on_weight_slider_change and update ebic_weight
+                self.weight_slider.set_val(val)
+            else:
+                self.ebic_weight = val
+        except Exception:
+            self.ebic_weight = val
 
     def enable_zoom(self, event):
         """Toggle zoom mode on/off"""
@@ -423,57 +499,14 @@ class SEMViewer:
 
             self.fig.canvas.draw_idle()
 
-            # Automatically run junction detection
-            try:
-                width_um = ask_junction_width()
-                if width_um is not None:
-                    half_width_px = int(np.round(width_um * 1e-6 / self.pixel_size))
-                    half_width_px = max(1, half_width_px)
-                    pixel_map = self.pixel_maps[self.index]
-                    roi, roi_coords = extract_line_rectangle(pixel_map,
-                                                                  self.manual_line_dense,
-                                                                  half_width_px)
-
-                    # Try to build EBIC/current ROI if available
-                    roi_current = None
-                    try:
-                        if self.current_maps is not None and len(self.current_maps) > 1 and self.current_maps[1] is not None:
-                            current_map = self.current_maps[1]
-                            roi_current, _ = extract_line_rectangle(current_map, self.manual_line_dense, half_width_px)
-                    except Exception:
-                        roi_current = None
-
-                    # Ask user for EBIC weight (1.0 by default)
-                    try:
-                        weight = ask_junction_weight()
-                        if weight is None:
-                            weight = 10.0
-                    except Exception:
-                        weight = 10.0
-                    print(f"Junction detection: using EBIC weight = {weight}")
-
-                    analyzer = JunctionAnalyzer(pixel_size_m=self.pixel_size)
-                    results = analyzer.detect(roi, self.manual_line_dense, roi_current=roi_current, weight_current=weight)
-
-                    if results:
-                        # Get the best result (which is the only one returned by Canny)
-                        best_result = results[0]
-                        detected_coords = best_result[1]
-
-                        # Store the detected line and its visual object as class attributes
-                        self.detected_junction_line = detected_coords
-                        self.detected_line_obj = Line2D(
-                            self.detected_junction_line[:, 0],
-                            self.detected_junction_line[:, 1],
-                            color='green',
-                            linewidth=2
-                        )
-                        self.ax.add_line(self.detected_line_obj)
-
-                    else:
-                        print("Junction detection failed.")
-            except Exception as e:
-                print(f"Auto junction detection error: {e}")
+            # Manual line created. Do not auto-run detection here.
+            # Clear any previously stored ROI so detection will be re-extracted when
+            # the user presses the 'Junction Detect' button.
+            print("Manual line drawn. Press 'Junction Detect' to run detection (uses EBIC weight slider).")
+            self._last_roi = None
+            self._last_roi_current = None
+            self._last_manual_line_dense = self.manual_line_dense
+            self._last_half_width_px = None
 
 
     def _on_close(self, event):
@@ -924,13 +957,8 @@ class SEMViewer:
         except Exception:
             roi_current = None
 
-        # Ask user for EBIC weight
-        try:
-            weight = ask_junction_weight()
-            if weight is None:
-                weight = 10.0
-        except Exception:
-            weight = 10.0
+        # Use EBIC weight from slider if available, otherwise use default
+        weight = getattr(self, 'ebic_weight', 10.0)
         print(f"Junction detection: using EBIC weight = {weight}")
 
         # Detect junction (returns a single result in a list)
@@ -940,11 +968,97 @@ class SEMViewer:
             print("Junction detection failed.")
             return
 
-        # Visualize on the original pixel_map (image)
-        analyzer.visualize_results(pixel_map, self.manual_line_dense, results)
+        # Persist last ROI and settings so slider changes can re-run detection
+        self._last_roi = roi
+        self._last_roi_current = roi_current
+        self._last_manual_line_dense = self.manual_line_dense
+        self._last_half_width_px = half_width_px
+
+        # Visualize on the original pixel_map (image) and also draw the detected line on the viewer axes
+        try:
+            # Draw analyzer's visualization if available
+            analyzer.visualize_results(pixel_map, self.manual_line_dense, results)
+        except Exception:
+            pass
+
+        # Extract best detected coordinates and draw green line on viewer
+        try:
+            best_result = results[0]
+            detected_coords = best_result[1]
+            self.detected_junction_line = detected_coords
+            # remove previous if present
+            try:
+                if hasattr(self, 'detected_line_obj') and self.detected_line_obj is not None:
+                    try:
+                        self.detected_line_obj.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            self.detected_line_obj = Line2D(self.detected_junction_line[:, 0], self.detected_junction_line[:, 1], color='green', linewidth=2)
+            self.ax.add_line(self.detected_line_obj)
+            if hasattr(self, 'fig') and self.fig is not None:
+                self.fig.canvas.draw_idle()
+        except Exception:
+            pass
     
     def _fit_profiles(self, event=None):
         fit_perpendicular_profiles(self)
 
     def _fit_profiles_linear(self, event=None):
         fit_perpendicular_profiles_linear(self)
+
+    def _update_detected_junction_with_weight(self):
+        """Re-run junction detection on the last ROI using the current EBIC weight
+        and update the green detected line on the main viewer axes.
+        """
+        try:
+            if self._last_roi is None or self._last_manual_line_dense is None:
+                return
+
+            analyzer = JunctionAnalyzer(pixel_size_m=self.pixel_size)
+            results = analyzer.detect(self._last_roi, self._last_manual_line_dense,
+                                      roi_current=self._last_roi_current,
+                                      weight_current=self.ebic_weight)
+
+            if not results:
+                # remove previous visualization if it exists
+                try:
+                    if hasattr(self, 'detected_line_obj') and self.detected_line_obj is not None:
+                        try:
+                            self.detected_line_obj.remove()
+                        except Exception:
+                            pass
+                        self.detected_line_obj = None
+                        self.detected_junction_line = None
+                        if hasattr(self, 'fig') and self.fig is not None:
+                            self.fig.canvas.draw_idle()
+                except Exception:
+                    pass
+                return
+
+            best_result = results[0]
+            detected_coords = best_result[1]
+            self.detected_junction_line = detected_coords
+
+            # remove previous detected line visualization if present
+            try:
+                if hasattr(self, 'detected_line_obj') and self.detected_line_obj is not None:
+                    try:
+                        self.detected_line_obj.remove()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            self.detected_line_obj = Line2D(self.detected_junction_line[:, 0], self.detected_junction_line[:, 1], color='green', linewidth=2)
+            try:
+                self.ax.add_line(self.detected_line_obj)
+            except Exception:
+                pass
+
+            if hasattr(self, 'fig') and self.fig is not None:
+                self.fig.canvas.draw_idle()
+        except Exception as e:
+            print(f"Failed to update detected junction with new weight: {e}")
