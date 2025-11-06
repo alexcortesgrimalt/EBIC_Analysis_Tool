@@ -289,7 +289,8 @@ def fit_perpendicular_profiles(viewer):
         print("No perpendicular profiles available. Draw them first.")
         return None
     
-    extractor = DiffusionLengthExtractor(viewer.pixel_size, smoothing_sigma=1)
+    pixel_size = getattr(viewer, 'pixel_size', 1e-6)
+    extractor = DiffusionLengthExtractor(pixel_size, smoothing_sigma=1)
     extractor.load_profiles(viewer.perpendicular_profiles)
     extractor.fit_all_profiles()
     extractor.visualize_fitted_profiles()
@@ -317,7 +318,8 @@ def fit_perpendicular_profiles_linear(viewer):
         return None
 
     results = []
-    extractor = DiffusionLengthExtractor(viewer.pixel_size, smoothing_sigma=1)
+    pixel_size = getattr(viewer, 'pixel_size', 1e-6)
+    extractor = DiffusionLengthExtractor(pixel_size, smoothing_sigma=1)
 
     for prof in viewer.perpendicular_profiles:
         profile_id = prof.get('id', None)
@@ -333,7 +335,7 @@ def fit_perpendicular_profiles_linear(viewer):
         tail = y[-10:]
         baseline = max(np.median(tail), 0.0)
 
-        # Subtract baseline and floor small positives to allow log10
+        # Subtract baseline and floor small positives to allow natural log
         y_corr = y - baseline
         pos = y_corr[y_corr > 0]
         if pos.size > 0:
@@ -377,7 +379,7 @@ def fit_perpendicular_profiles_linear(viewer):
             fig, ax = plt.subplots(figsize=(8, 4))
             ax.plot(x, logy, 'k.-', lw=1.0, ms=4, label='ln(Current)')
 
-            # Plot all tailcut fits faintly (converted from natural log to log10)
+            # Plot all tailcut fits faintly in natural-log domain
             for s in sides:
                 try:
                     slope = float(s.get('slope'))
@@ -385,13 +387,12 @@ def fit_perpendicular_profiles_linear(viewer):
                     x_fit = np.array(s.get('x_vals', s.get('x', [])), dtype=float)
                     # natural-log fit -> plotting in natural-log (no conversion)
                     y_log_nat = slope * x_fit + intercept
-                    y_log10 = y_log_nat
                     # For left-side fits, x_vals were measured positively from the side -> negate for plotting
                     if 'Left' in s.get('side', ''):
                         x_plot = -x_fit
-                        ax.plot(x_plot, y_log10, color='blue', alpha=0.25, linewidth=1)
+                        ax.plot(x_plot, y_log_nat, color='blue', alpha=0.25, linewidth=1)
                     else:
-                        ax.plot(x_fit, y_log10, color='red', alpha=0.25, linewidth=1)
+                        ax.plot(x_fit, y_log_nat, color='red', alpha=0.25, linewidth=1)
                 except Exception:
                     continue
 
@@ -399,13 +400,11 @@ def fit_perpendicular_profiles_linear(viewer):
             if best_left is not None:
                 sx = np.array(best_left.get('x_vals', best_left.get('x', [])), dtype=float)
                 yln = best_left['slope'] * sx + best_left['intercept']
-                yb10 = yln / np.log(10.0)
-                ax.plot(-sx, yb10, 'b-', lw=2.2, label=f"Best Left (s={best_left['slope']:.3g}, R²={best_left['r2']:.2f})")
+                ax.plot(-sx, yln, 'b-', lw=2.2, label=f"Best Left (s={best_left['slope']:.3g}, R²={best_left['r2']:.2f})")
             if best_right is not None:
                 sx = np.array(best_right.get('x_vals', best_right.get('x', [])), dtype=float)
                 yln = best_right['slope'] * sx + best_right['intercept']
-                yb10 = yln / np.log(10.0)
-                ax.plot(sx, yb10, 'r-', lw=2.2, label=f"Best Right (s={best_right['slope']:.3g}, R²={best_right['r2']:.2f})")
+                ax.plot(sx, yln, 'r-', lw=2.2, label=f"Best Right (s={best_right['slope']:.3g}, R²={best_right['r2']:.2f})")
 
             # Mark intersection (at x=0)
             ax.axvline(0.0, color='lime', linestyle='--', alpha=0.7)
@@ -504,7 +503,8 @@ def generate_perpendicular_profiles(viewer, num_lines, length_um):
     plot_perpendicular_profiles(profiles, ax=viewer.ax, fig=viewer.fig)
     # Also save log(EBIC) vs distance plots for the generated perpendicular profiles
     try:
-        extractor = DiffusionLengthExtractor(viewer.pixel_size, smoothing_sigma=1)
+        pixel_size = getattr(viewer, 'pixel_size', 1e-6)
+        extractor = DiffusionLengthExtractor(pixel_size, smoothing_sigma=1)
         extractor.load_profiles(profiles)
         extractor.visualize_log_profiles()
     except Exception as e:

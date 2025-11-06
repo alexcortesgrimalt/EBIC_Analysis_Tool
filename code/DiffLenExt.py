@@ -123,7 +123,7 @@ class DiffusionLengthExtractor:
         return 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
 
     def fit_profile_sides(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
-                          plot_left=True, plot_right=True):
+                          plot_left=True, plot_right=True, prevent_cross_peak=False):
         """
         Fit falling exponentials on both sides:
         1. Find the correct starting point by shifting until 1/λ stabilizes.
@@ -161,13 +161,22 @@ class DiffusionLengthExtractor:
         for shift in range(pos_allow, -16, -1):
             if left_stable:
                 break
-            start_idx_left = max(0, (intersection_idx if intersection_idx <= base_idx else base_idx) + shift)
+            # Anchor the left start search at the profile peak so we can always
+            # try starting as far right as the peak regardless of the provided
+            # intersection index. The `shift` then moves leftwards from there.
+            start_idx_left = max(0, base_idx + shift)
             left_x_raw = x_vals[:start_idx_left + 1]
             y_left_raw = y_vals[:start_idx_left + 1]
 
             y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
             y_left_flipped = y_left_filtered[::-1]
-            x_left_flipped = np.abs(left_x_raw)[::-1]
+            # compute local distances measured from the fit start (closest to peak)
+            # so the first element is 0.0 and distances increase away from the intersection
+            try:
+                start_pos_left = float(left_x_raw[-1])
+                x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
+            except Exception:
+                x_left_flipped = np.abs(left_x_raw)[::-1]
 
             cut_idx = self._find_snr_end_index(y_left_flipped)
             left_y_truncated = y_left_flipped[:cut_idx]
@@ -192,15 +201,22 @@ class DiffusionLengthExtractor:
         for shift in range(neg_allow, 16):
             if right_stable:
                 break
-            start_idx_right = min(len(x_vals) - 1,
-                                  (intersection_idx if intersection_idx >= base_idx else base_idx) + shift)
+            # Anchor the right start search at the profile peak so we can try
+            # moving the right-side start leftwards down to the peak.
+            start_idx_right = min(len(x_vals) - 1, base_idx + shift)
             right_x_raw = x_vals[start_idx_right:]
             y_right_raw = y_vals[start_idx_right:]
 
             y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
             cut_idx = self._find_snr_end_index(y_right_filtered)
             right_y_truncated = y_right_filtered[:cut_idx]
-            right_x_truncated = right_x_raw[:cut_idx]
+            # compute local distances from the fit start (first element)
+            try:
+                start_pos_right = float(right_x_raw[0])
+                right_x_local = np.array(right_x_raw, dtype=float) - start_pos_right
+                right_x_truncated = right_x_local[:cut_idx]
+            except Exception:
+                right_x_truncated = right_x_raw[:cut_idx]
 
             if len(right_x_truncated) > 2:
                 right_fit = self._fit_falling(
@@ -214,13 +230,27 @@ class DiffusionLengthExtractor:
                             right_stable, best_right_idx = True, start_idx_right
                         prev_right_val = curr_val
 
+        # --- Choose best candidates by R² (if any) and then do tail truncations ---
+        best_left_idx = None
+        if left_candidates:
+            # pick candidate with highest R²
+            best_left_idx = max(left_candidates, key=lambda t: t[1].get('r2', -np.inf))[0]
+
+        best_right_idx = None
+        if right_candidates:
+            best_right_idx = max(right_candidates, key=lambda t: t[1].get('r2', -np.inf))[0]
+
         # --- Tail truncations with fixed start indices ---
         if best_left_idx is not None:
             left_x_raw = x_vals[:best_left_idx + 1]
             y_left_raw = y_vals[:best_left_idx + 1]
             y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
             y_left_flipped = y_left_filtered[::-1]
-            x_left_flipped = np.abs(left_x_raw)[::-1]
+            try:
+                start_pos_left = float(left_x_raw[-1])
+                x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
+            except Exception:
+                x_left_flipped = np.abs(left_x_raw)[::-1]
 
             cut_idx = self._find_snr_end_index(y_left_flipped)
             left_y_truncated = y_left_flipped[:cut_idx]
@@ -228,7 +258,13 @@ class DiffusionLengthExtractor:
 
             results.extend(self._truncate_tail_and_fit(
                 left_x_truncated, left_y_truncated,
-                shift=0, side="Left", profile_id=profile_id
+                shift=0, side="Left", profile_id=profile_id,
+                # pass original-profile x coordinates corresponding to the
+                # truncated flipped array: left_x_raw[::-1] maps the flipped
+                # distances back to profile positions starting at the start_idx
+                global_x=left_x_raw[::-1][:cut_idx],
+                prevent_cross_peak=prevent_cross_peak,
+                ref=float(x_vals[base_idx])
             ))
 
         if best_right_idx is not None:
@@ -238,11 +274,21 @@ class DiffusionLengthExtractor:
 
             cut_idx = self._find_snr_end_index(y_right_filtered)
             right_y_truncated = y_right_filtered[:cut_idx]
-            right_x_truncated = right_x_raw[:cut_idx]
+            try:
+                start_pos_right = float(right_x_raw[0])
+                right_x_local = np.array(right_x_raw, dtype=float) - start_pos_right
+                right_x_truncated = right_x_local[:cut_idx]
+            except Exception:
+                right_x_truncated = right_x_raw[:cut_idx]
 
+            # Pass the ORIGINAL profile coordinates as global_x so overlays
+            # and depletion extraction map back to the profile axis correctly.
             results.extend(self._truncate_tail_and_fit(
                 right_x_truncated, right_y_truncated,
-                shift=0, side="Right", profile_id=profile_id
+                shift=0, side="Right", profile_id=profile_id,
+                global_x=right_x_raw[:cut_idx],
+                prevent_cross_peak=prevent_cross_peak,
+                ref=float(x_vals[base_idx])
             ))
 
         # --- Visualization: only tail truncations ---
@@ -257,12 +303,13 @@ class DiffusionLengthExtractor:
         """Helper to create the overlay plots."""
         plt.figure(figsize=(8, 5))
         plt.title(f"Profile {profile_id} - {side_to_plot} shifted fits")
-
-        # Determine the base data for the plot
+        # Center x-axis at the profile peak (x_vals[base_idx]) so 0 is the peak
+        ref = float(x_vals[base_idx])
+        # Determine the base data for the plot (and shift to peak-centered coords)
         if side_to_plot == 'Left':
-            x_base, y_base = x_vals[:base_idx + 1], y_vals[:base_idx + 1]
+            x_base, y_base = x_vals[:base_idx + 1] - ref, y_vals[:base_idx + 1]
         else:
-            x_base, y_base = x_vals[base_idx:], y_vals[base_idx:]
+            x_base, y_base = x_vals[base_idx:] - ref, y_vals[base_idx:]
 
         plt.plot(x_base, y_base, color='0.6', alpha=0.7, label=f'raw {side_to_plot.lower()}')
         y_filtered_base = self.apply_low_pass_filter(y_base, visualize=False)
@@ -270,8 +317,25 @@ class DiffusionLengthExtractor:
 
         for res in results:
             if res['side'].startswith(side_to_plot):
-                plt.plot(res['x_vals'], res['fit_curve'], lw=1.2,
-                         label=f"shift {res['shift']} (R²={res['r2']:.2f})")
+                # prefer global_x_vals (already in profile coords centered where we set them);
+                # otherwise map stored x_vals and shift by ref
+                x_plot = res.get('global_x_vals', None)
+                if x_plot is None:
+                    if 'Left' in res['side']:
+                        x_plot = -np.array(res['x_vals'], dtype=float) - ref
+                    else:
+                        x_plot = np.array(res['x_vals'], dtype=float) - ref
+                else:
+                    x_plot = np.array(x_plot, dtype=float) - ref
+                y_plot = np.array(res.get('fit_curve', []), dtype=float)
+                try:
+                    order = np.argsort(x_plot)
+                    x_plot = x_plot[order]
+                    y_plot = y_plot[order]
+                except Exception:
+                    pass
+                plt.plot(x_plot, y_plot, lw=1.2,
+                         label=f"shift {res['shift']} (R²={res.get('r2', float('nan')):.2f})")
 
         plt.xlabel("x (pixels)")
         plt.ylabel("Signal")
@@ -294,8 +358,43 @@ class DiffusionLengthExtractor:
         best_left = max(left_candidates, key=lambda r: r['r2']) if left_candidates else None
         best_right = max(right_candidates, key=lambda r: r['r2']) if right_candidates else None
 
-        left_start = -best_left['x_vals'][0] if best_left is not None else None
-        right_start = best_right['x_vals'][0] if best_right is not None else None
+        # Map fit x-values to the profile axis and pick the inner extremities
+        # (closest to the intersection): for the left side the fit x_vals are
+        # stored as positive distances from the left side, so we negate them
+        # to place them on the negative side of the profile axis. The inner
+        # edge (most-right on the left side) is therefore the maximum of the
+        # mapped x array. For the right side the inner edge is the minimum.
+        if best_left is not None:
+            try:
+                # prefer global_x_vals if available (already in profile coords)
+                if 'global_x_vals' in best_left:
+                    left_start = float(np.max(np.array(best_left['global_x_vals'], dtype=float)))
+                else:
+                    # fall back to mapping stored x_vals (distances) to negative
+                    left_x_mapped = -np.array(best_left['x_vals'], dtype=float)
+                    left_start = float(np.max(left_x_mapped))
+            except Exception:
+                try:
+                    left_start = float(-best_left['x_vals'][0])
+                except Exception:
+                    left_start = None
+        else:
+            left_start = None
+
+        if best_right is not None:
+            try:
+                if 'global_x_vals' in best_right:
+                    right_start = float(np.min(np.array(best_right['global_x_vals'], dtype=float)))
+                else:
+                    right_x_mapped = np.array(best_right['x_vals'], dtype=float)
+                    right_start = float(np.min(right_x_mapped))
+            except Exception:
+                try:
+                    right_start = float(best_right['x_vals'][0])
+                except Exception:
+                    right_start = None
+        else:
+            right_start = None
 
         if left_start is not None and right_start is not None:
             depletion_width = abs(right_start - left_start)
@@ -361,41 +460,69 @@ class DiffusionLengthExtractor:
 
             x = np.array(self.profiles[profile_id - 1]['dist_um'])
             y = np.array(self.profiles[profile_id - 1]['current'])
+            # center x axis at profile peak so x=0 corresponds to max(y)
+            base_idx = int(np.argmax(y))
+            ref = float(x[base_idx])
+            x_plot = x - ref
 
             fig, ax = plt.subplots(figsize=(8, 4))
-            ax.plot(x, y, 'k-', alpha=0.6, label="EBIC Profile")
+            ax.plot(x_plot, y, 'k-', alpha=0.6, label="EBIC Profile")
 
             left_start = depletion.get('left_start', None)
             right_start = depletion.get('right_start', None)
 
             # Shade depletion region if both edges present
             if left_start is not None and right_start is not None:
-                ax.axvspan(left_start, right_start, color='green', alpha=0.12, label='Depletion zone')
+                # shift edges to peak-centered plotting coords
+                ax.axvspan(left_start - ref, right_start - ref, color='green', alpha=0.12, label='Depletion zone')
 
             # Draw vertical lines
             if left_start is not None:
-                ax.axvline(left_start, color='b', linestyle='--', label="Left Start")
+                ax.axvline(left_start - ref, color='b', linestyle='--', label="Left Start")
             if right_start is not None:
-                ax.axvline(right_start, color='r', linestyle='--', label="Right Start")
+                ax.axvline(right_start - ref, color='r', linestyle='--', label="Right Start")
 
             # Overlay best-fit curves if available
             best_left = depletion.get('best_left_fit', None)
             best_right = depletion.get('best_right_fit', None)
 
             if best_left is not None:
-                # best_left['x_vals'] are in positive distances measured from the fit side
-                # map them to the profile x-axis: for left side we negate to place on the left
-                x_fit_left = -np.array(best_left['x_vals'])
-                y_fit_left = np.array(best_left['fit_curve'])
+                # Prefer global_x_vals if present (already in profile coords).
+                if 'global_x_vals' in best_left:
+                    x_fit_left = np.array(best_left['global_x_vals'], dtype=float) - ref
+                else:
+                    x_fit_left = -np.array(best_left['x_vals']) - ref
+                y_fit_left = np.array(best_left.get('fit_curve', []), dtype=float)
+                try:
+                    order = np.argsort(x_fit_left)
+                    x_fit_left = x_fit_left[order]
+                    y_fit_left = y_fit_left[order]
+                except Exception:
+                    pass
                 ax.plot(x_fit_left, y_fit_left, 'b-', lw=1.6, alpha=0.9, label='Left fit (best)')
-                # annotate R²
-                ax.text(x_fit_left[0], y_fit_left[0], f"R²={best_left['r2']:.2f}", color='b')
+                # annotate R² near the first plotted point
+                try:
+                    ax.text(x_fit_left[0], y_fit_left[0], f"R²={best_left['r2']:.2f}", color='b')
+                except Exception:
+                    pass
 
             if best_right is not None:
-                x_fit_right = np.array(best_right['x_vals'])
-                y_fit_right = np.array(best_right['fit_curve'])
+                if 'global_x_vals' in best_right:
+                    x_fit_right = np.array(best_right['global_x_vals'], dtype=float) - ref
+                else:
+                    x_fit_right = np.array(best_right['x_vals']) - ref
+                y_fit_right = np.array(best_right.get('fit_curve', []), dtype=float)
+                try:
+                    order = np.argsort(x_fit_right)
+                    x_fit_right = x_fit_right[order]
+                    y_fit_right = y_fit_right[order]
+                except Exception:
+                    pass
                 ax.plot(x_fit_right, y_fit_right, 'r-', lw=1.6, alpha=0.9, label='Right fit (best)')
-                ax.text(x_fit_right[0], y_fit_right[0], f"R²={best_right['r2']:.2f}", color='r')
+                try:
+                    ax.text(x_fit_right[0], y_fit_right[0], f"R²={best_right['r2']:.2f}", color='r')
+                except Exception:
+                    pass
 
             ax.set_title(f"Profile {profile_id} – Depletion Width = {depletion['depletion_width']:.2f} µm")
             ax.set_xlabel("Distance (µm)")
@@ -504,11 +631,25 @@ class DiffusionLengthExtractor:
             central_fits = [side for side in res['fit_sides'] if side['shift'] == 0]
             if not central_fits:
                 continue
+            # use original profile coords and center at its peak
+            x = np.array(self.profiles[profile_id - 1]['dist_um'])
+            y = np.array(self.profiles[profile_id - 1]['current'])
+            base_idx = int(np.argmax(y))
+            ref = float(x[base_idx])
 
             fig_fit, axes_fit = plt.subplots(1, 2, figsize=(12, 4))
             for ax, side in zip(axes_fit, central_fits):
-                ax.plot(side['x_vals'], side['y_vals'], 'r.', alpha=0.5, label='Raw EBIC')
-                ax.plot(side['x_vals'], side['fit_curve'], 'b-', linewidth=2, label='Central Fit')
+                # prefer global_x if present, otherwise map stored x_vals
+                if 'global_x_vals' in side:
+                    x_side = np.array(side['global_x_vals'], dtype=float) - ref
+                else:
+                    if 'Left' in side['side']:
+                        x_side = -np.array(side['x_vals'], dtype=float) - ref
+                    else:
+                        x_side = np.array(side['x_vals'], dtype=float) - ref
+
+                ax.plot(x_side, side['y_vals'], 'r.', alpha=0.5, label='Raw EBIC')
+                ax.plot(x_side, side['fit_curve'], 'b-', linewidth=2, label='Central Fit')
                 r2 = self._calculate_r2(side['y_vals'], side['fit_curve'])
                 ax.set_xlabel("Distance (µm)")
                 ax.set_ylabel("Current (nA)")
@@ -604,7 +745,11 @@ class DiffusionLengthExtractor:
                 ylabel = 'ln(Current)'
 
             fig, ax = plt.subplots(figsize=(8, 4))
-            ax.plot(x, logy, 'k-', lw=1.2, label=f'{ylabel}')
+            # center x axis so peak is at 0
+            base_idx = int(np.argmax(y))
+            ref = float(x[base_idx])
+            x_plot = x - ref
+            ax.plot(x_plot, logy, 'k-', lw=1.2, label=f'{ylabel}')
 
             # Optionally overlay best-fit transformed to log domain
             best_left = res.get('depletion', {}).get('best_left_fit', None)
@@ -613,7 +758,11 @@ class DiffusionLengthExtractor:
                 if b is None:
                     continue
                 try:
-                    x_fit = np.array(b['x_vals'])
+                    # prefer global mapping and center at peak
+                    if 'global_x_vals' in b:
+                        x_fit = np.array(b['global_x_vals'], dtype=float) - ref
+                    else:
+                        x_fit = np.array(b['x_vals'], dtype=float)
                     y_fit = np.array(b['fit_curve'])
                     # transform fit by the same baseline subtraction
                     y_fit_corr = y_fit - baseline
@@ -624,9 +773,18 @@ class DiffusionLengthExtractor:
                         y_fit_log = np.log(y_fit_corr)
                     # For left fit, x_fit was from flipped side
                     if 'Left' in b['side']:
-                        x_fit_plot = -x_fit
+                        x_fit_plot = -x_fit - ref if 'global_x_vals' not in b else x_fit
                     else:
-                        x_fit_plot = x_fit
+                        x_fit_plot = x_fit - ref if 'global_x_vals' not in b else x_fit
+                    # if global_x_vals was used we already subtracted ref above
+                    if 'global_x_vals' in b:
+                        x_fit_plot = np.array(b['global_x_vals'], dtype=float) - ref
+                    try:
+                        order = np.argsort(x_fit_plot)
+                        x_fit_plot = np.array(x_fit_plot)[order]
+                        y_fit_log = np.array(y_fit_log)[order]
+                    except Exception:
+                        pass
                     ax.plot(x_fit_plot, y_fit_log, color=color, lw=1.6, alpha=0.9, label=f'{label} (log)')
                 except Exception:
                     pass
@@ -814,7 +972,8 @@ class DiffusionLengthExtractor:
 
         return results
 
-    def _truncate_tail_and_fit(self, x, y, shift, side, profile_id=0):
+    def _truncate_tail_and_fit(self, x, y, shift, side, profile_id=0, global_x=None,
+                               prevent_cross_peak=False, ref=None):
         """
         Progressively truncate the tail and fit each case.
         Stops early if 1/λ stabilizes within tolerance.
@@ -833,8 +992,15 @@ class DiffusionLengthExtractor:
             if len(x_cut) < 3:
                 continue
 
+            # Fit on the local-distance array (positive distances from the
+            # fitting edge) to preserve the original fitting behavior. We
+            # will attach the absolute profile coords (global_x) and also
+            # recompute the fit curve evaluated on those global coords for
+            # correct overlaying in plots.
+            x_for_fit = np.array(x_cut, dtype=float)
+
             fit = self._fit_falling(
-                x=x_cut, y=y_cut,
+                x=x_for_fit, y=y_cut,
                 shift=shift,
                 side=f"{side}-tailcut{n - cut}",
                 profile_id=profile_id
@@ -846,6 +1012,70 @@ class DiffusionLengthExtractor:
                     if prev_val is not None and abs(curr_val - prev_val) <= tolerance:
                         stable_reached = True  # stop once stable
                     prev_val = curr_val
+                    # attach global x coordinates if provided so callers
+                    # can map fit curves to the original profile axis. Also
+                    # preserve the local-distance `x_vals` for backward
+                    # compatibility (tests and other code expect x_vals to
+                    # be the positive distances measured from the fitting
+                    # edge).
+                    try:
+                        if global_x is not None:
+                            gl = np.array(global_x[:cut], dtype=float)
+                        else:
+                            gl = np.array(x_cut, dtype=float)
+                        # Optionally prevent the fit segment from crossing
+                        # the profile peak (ref). For left fits we clamp
+                        # values to be <= ref; for right fits we clamp to
+                        # be >= ref. This makes overlays stop at the peak.
+                        if prevent_cross_peak and (ref is not None):
+                            if side.startswith('Left'):
+                                gl = np.minimum(gl, float(ref))
+                            else:
+                                gl = np.maximum(gl, float(ref))
+                        fit['global_x_vals'] = gl
+                    except Exception:
+                        fit['global_x_vals'] = np.array(x_cut, dtype=float)
+
+                    # Preserve the local-distance x_vals for backward compatibility
+                    try:
+                        fit['x_vals'] = np.array(x_cut, dtype=float)
+                    except Exception:
+                        fit['x_vals'] = np.array(x_cut, dtype=float)
+
+                    # Recompute fit_curve evaluated at the mapped global
+                    # coordinates so plotting overlays align directly with
+                    # fit['global_x_vals'] (which plotting prefers).
+                    try:
+                        params = fit.get('parameters', None)
+                        if params is not None:
+                            # Map global profile coordinates back to the local
+                            # distance domain used for fitting. The first
+                            # element of global_x_vals corresponds to the
+                            # fit start (closest to the intersection).
+                            if 'global_x_vals' in fit:
+                                gl = np.array(fit['global_x_vals'], dtype=float)
+                                if gl.size > 0:
+                                    start_pos = float(gl[0])
+                                else:
+                                    start_pos = 0.0
+                                if 'Left' in side:
+                                    x_for_global_eval = np.abs(start_pos - gl)
+                                else:
+                                    x_for_global_eval = gl - start_pos
+                            else:
+                                x_for_global_eval = np.array(x_cut, dtype=float)
+
+                            # Evaluate on the same local-distance array used
+                            # for fitting and keep that as the global-fit curve
+                            # so each fit value corresponds elementwise to
+                            # the entries of fit['global_x_vals'] (which is
+                            # built to align with x_cut). Keep a local copy
+                            # as well for debugging.
+                            fit_local = self.exp_model(np.array(x_for_fit, dtype=float), *params)
+                            fit['fit_curve_local'] = fit_local
+                            fit['fit_curve'] = fit_local
+                    except Exception:
+                        pass
                     results.append(fit)
 
         return results
@@ -920,10 +1150,12 @@ class DiffusionLengthExtractor:
         plt.title(f"Profile {profile_id} – {side_to_plot} tail truncations")
 
         # Base data
+        # center x axis at peak
+        ref = float(x_vals[base_idx])
         if side_to_plot == 'Left':
-            x_base, y_base = x_vals[:base_idx + 1], y_vals[:base_idx + 1]
+            x_base, y_base = x_vals[:base_idx + 1] - ref, y_vals[:base_idx + 1]
         else:
-            x_base, y_base = x_vals[base_idx:], y_vals[base_idx:]
+            x_base, y_base = x_vals[base_idx:] - ref, y_vals[base_idx:]
 
         plt.plot(x_base, y_base, color='0.6', alpha=0.7, label=f'raw {side_to_plot.lower()}')
         y_filtered_base = self.apply_low_pass_filter(y_base, visualize=False)
@@ -937,8 +1169,25 @@ class DiffusionLengthExtractor:
                     cut_val = int(side_str.split("tailcut")[-1].split()[0])
                 except Exception:
                     cut_val = -1
-                plt.plot(res['x_vals'], res['fit_curve'], lw=1.2,
-                         label=f"tailcut {cut_val} (1/λ={res['inv_lambda']:.2f})")
+                # prefer global x mapped to profile coords when available
+                # prefer global mapping; otherwise map and shift to peak-centered
+                x_plot = res.get('global_x_vals', None)
+                if x_plot is None:
+                    if side_to_plot == 'Left':
+                        x_plot = -np.array(res['x_vals'], dtype=float) - ref
+                    else:
+                        x_plot = np.array(res['x_vals'], dtype=float) - ref
+                else:
+                    x_plot = np.array(x_plot, dtype=float) - ref
+                y_plot = np.array(res.get('fit_curve', []), dtype=float)
+                try:
+                    order = np.argsort(x_plot)
+                    x_plot = x_plot[order]
+                    y_plot = y_plot[order]
+                except Exception:
+                    pass
+                plt.plot(x_plot, y_plot, lw=1.2,
+                         label=f"tailcut {cut_val} (1/λ={res.get('inv_lambda', float('nan')):.2f})")
 
         plt.xlabel("x (pixels)")
         plt.ylabel("Signal")
@@ -1024,10 +1273,23 @@ class DiffusionLengthExtractor:
         try:
             # fit linear model to natural log
             logy = np.log(y_safe)
-            p = np.polyfit(x, logy, 1)
+
+            # For left-side fits we want the slope to be positive when the
+            # signal falls away from the intersection. Internally we fit
+            # against a signed x-axis: invert x for left fits so that the
+            # returned slope follows the test's sign convention. We still
+            # store `x_vals` as the positive distances measured from the
+            # fitting side so plotting logic remains unchanged.
+            x_arr = np.array(x, dtype=float)
+            if 'Left' in side:
+                x_for_fit = -x_arr
+            else:
+                x_for_fit = x_arr
+
+            p = np.polyfit(x_for_fit, logy, 1)
             slope = float(p[0])
             intercept = float(p[1])
-            log_fit = np.polyval(p, x)
+            log_fit = np.polyval(p, x_for_fit)
             fit_curve = np.exp(log_fit)
 
             # slope has units 1/µm (x in µm). inv_lambda in µm is 1/|slope|.
@@ -1062,7 +1324,8 @@ class DiffusionLengthExtractor:
             print(f"{side} linear fit failed (shift {shift}) for profile {profile_id}: {e}")
             return None
 
-    def _truncate_tail_and_fit_linear(self, x, y, shift, side, profile_id=0):
+    def _truncate_tail_and_fit_linear(self, x, y, shift, side, profile_id=0, global_x=None,
+                                      prevent_cross_peak=False, ref=None):
         """
         Progressively truncate the tail and fit each case for linear-on-log fits.
         """
@@ -1093,12 +1356,54 @@ class DiffusionLengthExtractor:
                     if prev_val is not None and abs(curr_val - prev_val) <= tolerance:
                         stable_reached = True
                     prev_val = curr_val
+                    try:
+                        if global_x is not None:
+                            gl = np.array(global_x[:cut], dtype=float)
+                        else:
+                            gl = np.array(x_cut, dtype=float)
+                        if prevent_cross_peak and (ref is not None):
+                            if side.startswith('Left'):
+                                gl = np.minimum(gl, float(ref))
+                            else:
+                                gl = np.maximum(gl, float(ref))
+                        fit['global_x_vals'] = gl
+                    except Exception:
+                        fit['global_x_vals'] = np.array(x_cut, dtype=float)
+                    # compute fit_curve consistent with global_x_vals for plotting
+                    try:
+                        params = fit.get('parameters', None)
+                        if params is not None:
+                            # linear-fit stores slope/intercept in parameters
+                            slope, intercept = params[0], params[1]
+                            # Map global coords back to the local fit domain
+                            if 'global_x_vals' in fit:
+                                gl = np.array(fit['global_x_vals'], dtype=float)
+                                if gl.size > 0:
+                                    start_pos = float(gl[0])
+                                else:
+                                    start_pos = 0.0
+                                if 'Left' in side:
+                                    x_eval = np.abs(start_pos - gl)
+                                else:
+                                    x_eval = gl - start_pos
+                            else:
+                                x_eval = np.array(x_cut, dtype=float)
+                            # compute fit curve in linear domain (exp of poly)
+                            log_fit = slope * x_eval + intercept
+                            # Use the local-domain evaluation as the canonical
+                            # fit_curve so it lines up elementwise with
+                            # fit['global_x_vals'].
+                            fit_local = np.exp(np.polyval([slope, intercept], np.array(x_cut, dtype=float)))
+                            fit['fit_curve_local'] = fit_local
+                            fit['fit_curve'] = fit_local
+                    except Exception:
+                        pass
                     results.append(fit)
 
         return results
 
     def fit_profile_sides_linear(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
-                                 plot_left=True, plot_right=True):
+                                 plot_left=True, plot_right=True, prevent_cross_peak=False):
         """
         Same flow as fit_profile_sides but fits linear models on ln(current) for
         left and right sides. Uses the same shifting and tail-cut truncation logic.
@@ -1110,21 +1415,38 @@ class DiffusionLengthExtractor:
         if intersection_idx is None:
             intersection_idx = base_idx
 
+        # Mirror the exponential fitter: allow the left-side start to move
+        # rightwards up to the profile peak so we can try fitting closer to
+        # the maximum when the intersection is offset.
+        n = len(x_vals)
+        relative = int(base_idx - intersection_idx)
+        pos_allow = max(0, relative)
+        pos_allow = min(pos_allow, n - 1)
+        neg_allow = min(0, relative)
+        neg_allow = max(neg_allow, -(n - 1))
+
         results = []
         tolerance = self.pixel_size * 1e6
 
         # --- LEFT side: find start index ---
         prev_left_val, left_stable, best_left_idx = None, False, None
-        for shift in range(0, -16, -1):  # try shifts leftwards
+        for shift in range(pos_allow, -16, -1):  # try shifts leftwards (allow rightwards up to peak)
             if left_stable:
                 break
-            start_idx_left = max(0, (intersection_idx if intersection_idx <= base_idx else base_idx) + shift)
+            # Anchor the left start search at the profile peak so the left
+            # start can attempt to reach the maximum peak regardless of
+            # the provided intersection index.
+            start_idx_left = max(0, base_idx + shift)
             left_x_raw = x_vals[:start_idx_left + 1]
             y_left_raw = y_vals[:start_idx_left + 1]
 
             y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
             y_left_flipped = y_left_filtered[::-1]
-            x_left_flipped = np.abs(left_x_raw)[::-1]
+            try:
+                start_pos_left = float(left_x_raw[-1])
+                x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
+            except Exception:
+                x_left_flipped = np.abs(left_x_raw)[::-1]
 
             cut_idx = self._find_snr_end_index(y_left_flipped)
             left_y_truncated = y_left_flipped[:cut_idx]
@@ -1144,11 +1466,11 @@ class DiffusionLengthExtractor:
 
         # --- RIGHT side: find start index ---
         prev_right_val, right_stable, best_right_idx = None, False, None
-        for shift in range(0, 16):  # try shifts rightwards
+        for shift in range(neg_allow, 16):  # try shifts rightwards (allow leftwards down to peak)
             if right_stable:
                 break
-            start_idx_right = min(len(x_vals) - 1,
-                                  (intersection_idx if intersection_idx >= base_idx else base_idx) + shift)
+            # Anchor the right start at the profile peak as well for symmetry.
+            start_idx_right = min(len(x_vals) - 1, base_idx + shift)
             right_x_raw = x_vals[start_idx_right:]
             y_right_raw = y_vals[start_idx_right:]
 
@@ -1183,7 +1505,10 @@ class DiffusionLengthExtractor:
 
             results.extend(self._truncate_tail_and_fit_linear(
                 left_x_truncated, left_y_truncated,
-                shift=0, side="Left", profile_id=profile_id
+                shift=0, side="Left", profile_id=profile_id,
+                global_x=left_x_raw[::-1][:cut_idx],
+                prevent_cross_peak=prevent_cross_peak,
+                ref=float(x_vals[base_idx])
             ))
 
         if best_right_idx is not None:
@@ -1197,7 +1522,10 @@ class DiffusionLengthExtractor:
 
             results.extend(self._truncate_tail_and_fit_linear(
                 right_x_truncated, right_y_truncated,
-                shift=0, side="Right", profile_id=profile_id
+                shift=0, side="Right", profile_id=profile_id,
+                global_x=right_x_raw[:cut_idx],
+                prevent_cross_peak=prevent_cross_peak,
+                ref=float(x_vals[base_idx])
             ))
 
         # --- Visualization: only tail truncations ---
