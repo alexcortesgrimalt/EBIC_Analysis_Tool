@@ -17,7 +17,7 @@ if os.path.isdir(PERP_DIR):
         os.chdir(PERP_DIR)
     except Exception:
         pass
-FNAME_RE = re.compile(r'(?P<sample>[^_]+)_(?P<bias>\d+)_perp_(?P<num>\d+)\.csv$', re.IGNORECASE)
+FNAME_RE = re.compile(r'(?P<sample>[^_]+)_(?P<bias>-?\d+)_perp_(?P<num>\d+)\.csv$', re.IGNORECASE)
 
 
 def parse_filename(fname):

@@ -9,7 +9,7 @@ class JunctionAnalyzer:
     def __init__(self, pixel_size_m):
         self.pixel_size_m = pixel_size_m  # meters per pixel
 
-    def detect(self, roi, manual_line, roi_current=None, weight_current=10.0, debug=True, sweep_weights=None, _sweep_call=False):
+    def detect(self, roi, manual_line, roi_current=None, weight_current=10.0, debug=False, sweep_weights=None, _sweep_call=False):
         h, w = roi.shape
 
         # --- resample manual_line to match ROI width ---
@@ -231,7 +231,7 @@ class JunctionAnalyzer:
     # ---------------------------------------------------------------------
     # Canny detection
     # ---------------------------------------------------------------------
-    def _detect_junction_canny(self, roi, roi_current=None, weight_current=10.0, debug=True):
+    def _detect_junction_canny(self, roi, roi_current=None, weight_current=10.0, debug=False):
         """Detect junction using Canny edge detection with Otsu's adaptive thresholds.
 
         Combines SEM and optional EBIC/current gradients per-column. When debug=True
