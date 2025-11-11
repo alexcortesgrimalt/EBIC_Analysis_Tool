@@ -58,17 +58,60 @@ class SEMStarterGUI:
         output_folder = Path(filedialog.askdirectory(title="Select Output Folder") or "tiff_test_output")
         processed_names = self.processor.process_files(selected_files, output_folder)
 
+        # If multiple files were selected, ask whether they're a voltage sweep of the same sample.
+        if len(selected_files) > 1:
+            is_sweep = messagebox.askyesno("Voltage sweep?", "Open selected files as a voltage sweep of the same sample (align across files)?")
+        else:
+            is_sweep = False
+
         if not processed_names:
             messagebox.showerror("Error", "No processed frames found.")
             return
 
-        # Dataset selection
-        if len(processed_names) == 1:
-            self.open_viewer(output_folder, processed_names[0])
-        else:
+        # Dataset selection / sweep handling
+        if is_sweep and len(processed_names) > 1:
+            # Load all processed datasets in background and open a multi-dataset viewer
+            all_maps = self.processor.load_multiple_maps(output_folder, processed_names)
+
+            # Ask which dataset to display initially
             sample_name = self.choose_dataset(processed_names)
-            if sample_name:
-                self.open_viewer(output_folder, sample_name)
+            if sample_name is None:
+                return
+
+            # find index
+            start_index = processed_names.index(sample_name)
+
+            # open SEMViewer with sweep datasets
+            if messagebox.askyesno("Open Viewer", f"Open interactive viewer for sweep (showing {sample_name})?"):
+                # transform all_maps into sweep_datasets list of dicts expected by SEMViewer
+                sweep_datasets = []
+                for pix, cur, psize, sname, framesz in all_maps:
+                    sweep_datasets.append({
+                        'pixel_maps': pix,
+                        'current_maps': cur,
+                        'pixel_size': psize,
+                        'sample_name': sname,
+                        'frame_sizes': framesz
+                    })
+
+                viewer = SEMViewer(sweep_datasets[start_index]['pixel_maps'],
+                                   sweep_datasets[start_index]['current_maps'],
+                                   sweep_datasets[start_index]['pixel_size'],
+                                   sweep_datasets[start_index]['sample_name'],
+                                   frame_sizes=sweep_datasets[start_index]['frame_sizes'],
+                                   sweep_datasets=sweep_datasets,
+                                   sweep_start_index=start_index)
+                viewer.show()
+            else:
+                messagebox.showinfo("Done", f"Processed {len(processed_names)} datasets for sweep. Viewer skipped.")
+        else:
+            # Dataset selection
+            if len(processed_names) == 1:
+                self.open_viewer(output_folder, processed_names[0])
+            else:
+                sample_name = self.choose_dataset(processed_names)
+                if sample_name:
+                    self.open_viewer(output_folder, sample_name)
 
     def choose_dataset(self, dataset_names):
         win = tk.Toplevel(self.root)

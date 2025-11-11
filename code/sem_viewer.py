@@ -39,7 +39,7 @@ from .ROI_extractor import extract_line_rectangle
 
 # ==================== SEM VIEWER ====================
 class SEMViewer:
-    def __init__(self, pixel_maps, current_maps, pixel_size, sample_name, frame_sizes=None, dpi=100):
+    def __init__(self, pixel_maps, current_maps, pixel_size, sample_name, frame_sizes=None, dpi=100, sweep_datasets=None, sweep_start_index=0):
         self.perpendicular_profiles = None
         self.pixel_maps = pixel_maps
         self.current_maps = current_maps
@@ -81,6 +81,9 @@ class SEMViewer:
         # flag used to avoid recursion when syncing slider/textbox
         self._weight_update_in_progress = False
 
+        self.detected_junction_line = None
+        self.detected_on_dataset_index = None
+
         # DPI and figure size to match the first frame
         width_px, height_px = self.frame_sizes[0]
         self.dpi = dpi
@@ -112,110 +115,153 @@ class SEMViewer:
         self.cid_click = self.fig.canvas.mpl_connect('button_press_event', self._on_click)
         self.junction_analyzer = JunctionAnalyzer(pixel_size_m=self.pixel_size)
 
+        # Sweep datasets support: optional list of dicts with keys
+        # 'pixel_maps','current_maps','pixel_size','sample_name','frame_sizes'
+        self.sweep_datasets = sweep_datasets
+        # Index within sweep_datasets currently displayed
+        self.sweep_index = int(sweep_start_index) if sweep_datasets is not None else None
+        # shifts (dx,dy) to map coordinates from reference (sweep_index) to each dataset
+        self.sweep_shifts = None
+        # per-dataset detection and perpendicular results (populated by Detect Sweep)
+        self.sweep_detected_coords = None
+        self.sweep_perpendicular_profiles = None
+        # Debug mode: when True, automatically open the debug sweep view after actions
+        self.debug_mode = False
+        # If a sweep was provided, compute shifts relative to the initial shown dataset
+        if self.sweep_datasets is not None:
+            try:
+                self._compute_sweep_shifts()
+            except Exception:
+                self.sweep_shifts = None
+
     def _init_ui(self):
         # Fixed image axes: occupy full height, leave space for buttons on the right
         img_width_frac = 0.85  # fraction of figure width for image
         img_height_frac = 1.0  # full height
         self.ax.set_position([0, 0, img_width_frac, img_height_frac])
 
-        # Button layout parameters
-        button_w = 0.10
-        button_h = 0.05
-        spacing = 0.02
-        x_pos = img_width_frac + spacing  # buttons start to the right of image
-        y_start = 0.80  # top of first button (fraction of figure height)
-        y = y_start
+        # Button layout parameters (two-column layout) - tightened so both columns fit on screen
+        # Reduce spacing and button widths; compute columns from remaining side area
+        spacing = 0.01
+        button_h = 0.045
+        # available width at right side of image (leave small margins)
+        side_width = max(0.10, 1.0 - img_width_frac - 3 * spacing)
+        # split into two columns (leave a spacing between them)
+        # leave a tiny margin and cap to a sensible max
+        button_w = min(0.085, max(0.06, (side_width - spacing) / 2.0 - 0.005))
+        x_col1 = img_width_frac + spacing  # left column start
+        x_col2 = x_col1 + button_w + spacing  # right column start
+        # Vertical offset to shift the whole button column upward (fraction of figure height)
+        button_y_offset = 0.03
+        y_start = 0.88 + button_y_offset
+        y1 = y_start  # left column y
+        y2 = y_start  # right column y
 
-        # Overlay button
-        ax_overlay = self.fig.add_axes([x_pos, y, button_w, button_h])
+        # Left column buttons
+        ax_overlay = self.fig.add_axes([x_col1, y1, button_w, button_h])
         self.b_overlay = Button(ax_overlay, 'Overlay')
         self.b_overlay.on_clicked(self._toggle_overlay)
-        y -= (button_h + spacing)
+        y1 -= (button_h + spacing)
 
-        # Toggle Map button
-        ax_toggle = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_toggle = self.fig.add_axes([x_col1, y1, button_w, button_h])
         self.b_toggle = Button(ax_toggle, 'Toggle Map')
         self.b_toggle.on_clicked(self._toggle_map_type)
-        y -= (button_h + spacing)
+        y1 -= (button_h + spacing)
 
-        # Previous Frame button
-        ax_prev = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_prev = self.fig.add_axes([x_col1, y1, button_w, button_h])
         self.b_prev = Button(ax_prev, 'Previous')
         self.b_prev.on_clicked(self._prev_frame)
-        y -= (button_h + spacing)
+        y1 -= (button_h + spacing)
 
-        # Next Frame button
-        ax_next = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_next = self.fig.add_axes([x_col1, y1, button_w, button_h])
         self.b_next = Button(ax_next, 'Next')
         self.b_next.on_clicked(self._next_frame)
-        y -= (button_h + spacing)
+        y1 -= (button_h + spacing)
 
-        # Palette button
-        ax_palette = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_palette = self.fig.add_axes([x_col1, y1, button_w, button_h])
         self.b_palette = Button(ax_palette, 'Palette')
         self.b_palette.on_clicked(self._cycle_colormap)
-        y -= (button_h + spacing)
+        y1 -= (button_h + spacing)
 
-        # Perpendiculars button
-        ax_perp = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_perp = self.fig.add_axes([x_col1, y1, button_w, button_h])
         self.b_perp = Button(ax_perp, 'Perpendiculars')
         self.b_perp.on_clicked(self._show_perpendicular_input)
-        y -= (button_h + spacing)
+        y1 -= (button_h + spacing)
 
-        # Reset Zoom button
-        ax_reset = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_reset = self.fig.add_axes([x_col1, y1, button_w, button_h])
         self.b_reset = Button(ax_reset, 'Reset Zoom')
         self.b_reset.on_clicked(self._reset_zoom)
-        y -= (button_h + spacing)
+        y1 -= (button_h + spacing)
 
-        # Reset Lines button
-        ax_reset_overlays = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_reset_overlays = self.fig.add_axes([x_col1, y1, button_w, button_h])
         self.b_reset_overlays = Button(ax_reset_overlays, 'Reset Lines')
         self.b_reset_overlays.on_clicked(self._reset_overlays)
-        y -= (button_h + spacing)
+        y1 -= (button_h + spacing)
 
-        # Zoom button at the bottom
-        ax_zoom = self.fig.add_axes([x_pos, 0.01, button_w, button_h])
+        # Right column buttons
+        ax_zoom = self.fig.add_axes([x_col2, y2, button_w, button_h])
         self.zoom_btn = Button(ax_zoom, 'Zoom')
         self.zoom_btn.on_clicked(self.enable_zoom)
+        y2 -= (button_h + spacing)
 
-        # EBIC weight slider (controls weight used in junction detection)
-        # Place it just above the zoom button area
-        slider_h = 0.03
-        slider_y = 0.01 + button_h + spacing
-        ax_weight = self.fig.add_axes([x_pos, slider_y, button_w, slider_h])
-        # Slider range: 0.1 .. 100.0, default self.ebic_weight
-        self.weight_slider = Slider(ax_weight, 'EBIC weight', 0.1, 100.0, valinit=self.ebic_weight)
-        self.weight_slider.on_changed(self._on_weight_slider_change)
-        # Small textbox to the right so user can type an exact value
-        textbox_w = 0.04
-        textbox_x = x_pos + button_w + 0.005
-        ax_weight_val = self.fig.add_axes([textbox_x, slider_y, textbox_w, slider_h])
-        # TextBox initial value is the numeric value of ebic_weight
-        self.weight_textbox = TextBox(ax_weight_val, '', initial=str(self.ebic_weight))
-        self.weight_textbox.on_submit(self._on_weight_text_submit)
-
-        # Fit Profiles button
-        ax_fit = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_fit = self.fig.add_axes([x_col2, y2, button_w, button_h])
         self.b_fit = Button(ax_fit, 'Fit Profiles exp')
         self.b_fit.on_clicked(self._fit_profiles)
-        y -= (button_h + spacing)
+        y2 -= (button_h + spacing)
 
-        # Fit Profiles lin button
-        ax_fit_lin = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_fit_lin = self.fig.add_axes([x_col2, y2, button_w, button_h])
         self.b_fit_lin = Button(ax_fit_lin, 'Fit Profiles lin')
         self.b_fit_lin.on_clicked(self._fit_profiles_linear)
-        y -= (button_h + spacing)
+        y2 -= (button_h + spacing)
 
-        # --- Junction Detection button ---
-        ax_junc = self.fig.add_axes([x_pos, y, button_w, button_h])
+        ax_junc = self.fig.add_axes([x_col2, y2, button_w, button_h])
         self.b_junction = Button(ax_junc, 'Junction Detect')
         self.b_junction.on_clicked(self._detect_junction_button)
-        y -= (button_h + spacing)
+        y2 -= (button_h + spacing)
+
+        # EBIC weight slider placed under junction detect in right column
+        slider_h = 0.03
+        ax_weight = self.fig.add_axes([x_col2, y2, button_w, slider_h])
+        self.weight_slider = Slider(ax_weight, 'EBIC weight', 0.1, 100.0, valinit=self.ebic_weight)
+        self.weight_slider.on_changed(self._on_weight_slider_change)
+        textbox_w = 0.04
+        textbox_x = x_col2 + button_w + 0.005
+        ax_weight_val = self.fig.add_axes([textbox_x, y2, textbox_w, slider_h])
+        self.weight_textbox = TextBox(ax_weight_val, '', initial=str(self.ebic_weight))
+        self.weight_textbox.on_submit(self._on_weight_text_submit)
+        y2 -= (slider_h + spacing)
+
+        ax_observe = self.fig.add_axes([x_col2, y2, button_w, button_h])
+        self.b_observe = Button(ax_observe, 'Observe Junction')
+        self.b_observe.on_clicked(self._observe_detected_junction_button)
+        y2 -= (button_h + spacing)
+
+        ax_detect_sweep = self.fig.add_axes([x_col2, y2, button_w, button_h])
+        self.b_detect_sweep = Button(ax_detect_sweep, 'Detect Sweep')
+        self.b_detect_sweep.on_clicked(self._apply_detection_to_sweep)
+        y2 -= (button_h + spacing)
+
+        ax_debug = self.fig.add_axes([x_col2, y2, button_w, button_h])
+        self.b_debug = Button(ax_debug, 'Debug Sweep')
+        self.b_debug.on_clicked(self._debug_show_sweep)
+        y2 -= (button_h + spacing)
 
 
         # Connect close event
         self.fig.canvas.mpl_connect('close_event', self._on_close)
+
+        # If viewer was created with sweep datasets, add a small button to choose dataset
+        if getattr(self, 'sweep_datasets', None) is not None and len(self.sweep_datasets) > 1:
+            # place at top of button columns (use column positions so it fits)
+            top_h = 0.03
+            ax_choose = self.fig.add_axes([x_col1, 0.95, button_w, top_h])
+            self.b_choose = Button(ax_choose, 'Choose Dataset')
+            self.b_choose.on_clicked(self._choose_dataset_button)
+            # Add a Debug Mode toggle near the chooser in second column
+            ax_dbg_mode = self.fig.add_axes([x_col2, 0.95, button_w, top_h])
+            self.b_debug_mode = Button(ax_dbg_mode, 'Debug: OFF')
+            self.b_debug_mode.on_clicked(self._toggle_debug_mode)
+
 
     def _on_weight_slider_change(self, val):
         """Callback when the EBIC weight slider changes."""
@@ -248,6 +294,187 @@ class SEMViewer:
         except Exception:
             # ignore invalid values
             pass
+
+    def _compute_sweep_shifts(self):
+        """Compute pixel shifts for all sweep datasets relative to the current sweep_index dataset.
+
+        Uses FFT-based cross-correlation to estimate integer pixel translations.
+        """
+        datasets = self.sweep_datasets
+        ref_idx = int(self.sweep_index)
+        # allow using EBIC/current maps to help registration when available
+        # alignment weight controls contribution of current map (0 = ignore current, >0 includes it)
+        align_w = getattr(self, 'alignment_ebic_weight', None)
+        if align_w is None:
+            # default to moderate weight (0.5)
+            align_w = 0.5
+
+        # reference images (may include current map)
+        ref_pm = datasets[ref_idx].get('pixel_maps', [])
+        ref_cm = datasets[ref_idx].get('current_maps', [])
+        if not ref_pm:
+            raise RuntimeError('Reference dataset has no pixel map')
+        ref_img = ref_pm[0]
+        ref_cur = ref_cm[1] if (ref_cm and len(ref_cm) > 1) else None
+
+        shifts = []
+        for d in datasets:
+            pm = d.get('pixel_maps', [])
+            cm = d.get('current_maps', [])
+            if not pm:
+                shifts.append((0.0, 0.0))
+                continue
+            img = pm[0]
+            cur = cm[1] if (cm and len(cm) > 1) else None
+            try:
+                dx, dy = self._estimate_translation(ref_img, img, ref_current=ref_cur, cur_current=cur, weight_current=align_w)
+            except Exception:
+                dx, dy = 0.0, 0.0
+            shifts.append((float(dx), float(dy)))
+        self.sweep_shifts = shifts
+
+    def _estimate_translation(self, ref, img, ref_current=None, cur_current=None, weight_current=0.5):
+        """Estimate (dx, dy) shift to map ref coords to img coords.
+
+        If current/EBIC maps are available, they are optionally combined with the SEM image
+        to improve robustness: composite = norm(sem) + weight_current * norm(current).
+
+        Returns (dx, dy) in pixels (floats when subpixel estimation is used).
+        """
+        # Build composite images to register (use SEM and optionally EBIC/current)
+        def make_composite(sem_img, cur_img, w):
+            a = np.asarray(sem_img, dtype=float)
+            a = (a - np.mean(a)) / (np.std(a) + 1e-12)
+            if cur_img is None or w == 0:
+                return a
+            c = np.asarray(cur_img, dtype=float)
+            c = (c - np.mean(c)) / (np.std(c) + 1e-12)
+            return a + (w * c)
+
+        A = make_composite(ref, ref_current, weight_current)
+        B = make_composite(img, cur_current, weight_current)
+
+        # Crop to common minimal shape if sizes differ
+        if A.shape != B.shape:
+            minr = min(A.shape[0], B.shape[0])
+            minc = min(A.shape[1], B.shape[1])
+            A = A[:minr, :minc]
+            B = B[:minr, :minc]
+
+        # Try OpenCV phaseCorrelate for subpixel accuracy if available
+        try:
+            import cv2
+            # phaseCorrelate expects float32 and uses log-polar optionally; use simple windowing
+            A32 = np.float32(A)
+            B32 = np.float32(B)
+            # Optionally apply Hanning window to reduce edge effects
+            try:
+                win = cv2.createHanningWindow(A32.shape[::-1], cv2.CV_32F)
+                Aw = A32 * win
+                Bw = B32 * win
+            except Exception:
+                Aw = A32
+                Bw = B32
+            # returns (dx,dy) where positive dx means shift in x axis
+            shift, resp = cv2.phaseCorrelate(Aw, Bw)
+            # cv2.phaseCorrelate returns (shift_x, shift_y)
+            dx = float(shift[0])
+            dy = float(shift[1])
+            return (dx, dy)
+        except Exception:
+            # Fallback: integer-pixel FFT cross-correlation
+            fa = np.fft.fft2(A - np.mean(A))
+            fb = np.fft.fft2(B - np.mean(B))
+            cross = np.fft.ifft2(fa * np.conj(fb))
+            cross_abs = np.abs(cross)
+            maxpos = np.unravel_index(np.argmax(cross_abs), cross_abs.shape)
+            shift_y, shift_x = maxpos
+            # convert to signed shifts
+            if shift_x > cross.shape[1] // 2:
+                shift_x -= cross.shape[1]
+            if shift_y > cross.shape[0] // 2:
+                shift_y -= cross.shape[0]
+            return (float(shift_x), float(shift_y))
+
+    def _choose_dataset_button(self, event=None):
+        # Open small dialog to choose dataset
+        try:
+            win = tk.Toplevel()
+            win.title("Choose dataset to display")
+            listbox = tk.Listbox(win, selectmode=tk.SINGLE, width=60)
+            listbox.pack(padx=10, pady=10)
+            for i, d in enumerate(self.sweep_datasets):
+                listbox.insert(tk.END, f"{i}: {d.get('sample_name', 'dataset'+str(i))}")
+
+            def on_ok():
+                sel = listbox.curselection()
+                if not sel:
+                    tk.messagebox.showwarning("No selection", "Select a dataset to display")
+                    return
+                idx = sel[0]
+                win.destroy()
+                self._switch_to_dataset(idx)
+
+            tk.Button(win, text="Open", command=on_ok).pack(pady=6)
+            win.transient(self.fig.canvas.get_tk_widget().winfo_toplevel())
+            win.grab_set()
+            win.wait_window()
+        except Exception as e:
+            print(f"Failed to open dataset chooser: {e}")
+
+    def _switch_to_dataset(self, idx):
+        """Switch the viewer to display dataset at sweep_datasets[idx]."""
+        try:
+            ds = self.sweep_datasets[idx]
+            # update internal maps and meta
+            self.pixel_maps = ds['pixel_maps']
+            self.current_maps = ds['current_maps']
+            self.pixel_size = ds['pixel_size']
+            self.sample_name = ds['sample_name']
+            self.frame_sizes = ds.get('frame_sizes', self.frame_sizes)
+            self.sweep_index = int(idx)
+
+            # refresh display
+            self._update_display()
+            # If debug mode is on, show the debug sweep view to inspect alignment
+            try:
+                if getattr(self, 'debug_mode', False):
+                    self._debug_show_sweep()
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Failed to switch dataset: {e}")
+
+    def _get_displayed_detected_coords(self):
+        """Return detected junction coordinates mapped to coordinates of the currently displayed dataset."""
+        # If per-dataset sweep detections exist, prefer those for the displayed dataset
+        try:
+            if getattr(self, 'sweep_datasets', None) is not None and getattr(self, 'sweep_detected_coords', None) is not None:
+                target_idx = int(self.sweep_index) if self.sweep_index is not None else 0
+                if 0 <= target_idx < len(self.sweep_detected_coords):
+                    det = self.sweep_detected_coords[target_idx]
+                    if det is not None:
+                        return np.asarray(det)
+        except Exception:
+            pass
+
+        if not hasattr(self, 'detected_junction_line') or self.detected_junction_line is None:
+            return None
+        coords = np.asarray(self.detected_junction_line)
+        if self.sweep_datasets is None or self.sweep_shifts is None:
+            return coords
+        try:
+            # mapping: coords_in_target = coords_in_detected + (shift[target] - shift[detected])
+            det_idx = getattr(self, 'detected_on_dataset_index', self.sweep_index)
+            target_idx = self.sweep_index
+            sx_t, sy_t = self.sweep_shifts[target_idx]
+            sx_d, sy_d = self.sweep_shifts[det_idx]
+            dx = sx_t - sx_d
+            dy = sy_t - sy_d
+            mapped = coords + np.array([dx, dy])
+            return mapped
+        except Exception:
+            return coords
 
     def _on_weight_text_submit(self, text):
         """Callback when user types a value into the EBIC weight textbox and presses Enter."""
@@ -331,7 +558,7 @@ class SEMViewer:
                     print(f"Overlay requested but not enough frames: pixel_maps={len(self.pixel_maps)}, current_maps={len(self.current_maps)}")
                     self.ax.set_title("Overlay: Not enough frames.")
                 else:
-                    pixel = self.pixel_maps[0]
+                    pixel = self.pixel_maps[self.index]
                     # Prefer the processed current map, but if it wasn't produced (None),
                     # fall back to the raw second frame (pixel_maps[1]) which may already
                     # contain EBIC values in some TIFF varieties.
@@ -428,6 +655,31 @@ class SEMViewer:
 
             # Draw scale bar
             draw_scalebar(self.ax,self.pixel_size)
+
+            # Draw detected junction (mapped to currently displayed dataset) if available
+            try:
+                if hasattr(self, 'detected_junction_line') and self.detected_junction_line is not None:
+                    # remove previous visual object if present
+                    try:
+                        if hasattr(self, 'detected_line_obj') and self.detected_line_obj is not None:
+                            try:
+                                self.detected_line_obj.remove()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    mapped = self._get_displayed_detected_coords()
+                    if mapped is None:
+                        mapped = self.detected_junction_line
+
+                    self.detected_line_obj = Line2D(mapped[:, 0], mapped[:, 1], color='green', linewidth=2)
+                    try:
+                        self.ax.add_line(self.detected_line_obj)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             self.fig.canvas.draw_idle()
 
@@ -714,7 +966,90 @@ class SEMViewer:
             print("Main line not drawn.")
             return
 
-        # === Calculate perpendicular profiles ===
+        # If we have a sweep, compute and save perpendiculars for every dataset
+        if getattr(self, 'sweep_datasets', None) is not None and len(self.sweep_datasets) > 0:
+            print(f"Computing perpendicular profiles for all {len(self.sweep_datasets)} sweep datasets...")
+            # Determine base dense line representation
+            base_line = None
+            if isinstance(self.line_coords, np.ndarray):
+                base_line = self.line_coords
+            else:
+                # create dense line from tuple
+                (x0, y0), (x1, y1) = self.line_coords
+                line_length = int(np.ceil(np.hypot(x1 - x0, y1 - y0)))
+                xs = np.linspace(x0, x1, line_length)
+                ys = np.linspace(y0, y1, line_length)
+                base_line = np.column_stack([xs, ys])
+
+            # For each dataset, map the base line using sweep_shifts (if available) and compute profiles
+            for i, ds in enumerate(self.sweep_datasets):
+                try:
+                    # map line to dataset coords
+                    mapped_line = base_line.copy()
+                    if getattr(self, 'sweep_shifts', None) is not None and getattr(self, 'sweep_index', None) is not None:
+                        # mapping from reference (sweep_index) to target i
+                        ref_idx = int(self.sweep_index)
+                        sx_t, sy_t = self.sweep_shifts[i]
+                        sx_r, sy_r = self.sweep_shifts[ref_idx]
+                        dx = sx_t - sx_r
+                        dy = sy_t - sy_r
+                        mapped_line = mapped_line + np.array([dx, dy])
+
+                    sem_data = ds.get('pixel_maps', [None])[0]
+                    cur_data = None
+                    cm_list = ds.get('current_maps', [])
+                    if cm_list and len(cm_list) > 1:
+                        cur_data = cm_list[1]
+
+                    # If we have per-dataset detected junction coords, use them as detected_junction
+                    detected_junction = None
+                    if getattr(self, 'sweep_detected_coords', None) is not None:
+                        try:
+                            detected_junction = self.sweep_detected_coords[i]
+                        except Exception:
+                            detected_junction = None
+                    # fallback: map global detected_junction_line to this dataset
+                    if detected_junction is None and getattr(self, 'detected_junction_line', None) is not None:
+                        try:
+                            src_idx = getattr(self, 'detected_on_dataset_index', self.sweep_index)
+                            if self.sweep_shifts is not None and src_idx is not None:
+                                sx_i, sy_i = self.sweep_shifts[i]
+                                sx_s, sy_s = self.sweep_shifts[src_idx]
+                                dx = sx_i - sx_s
+                                dy = sy_i - sy_s
+                                detected_junction = np.asarray(self.detected_junction_line) + np.array([dx, dy])
+                            else:
+                                detected_junction = np.asarray(self.detected_junction_line)
+                        except Exception:
+                            detected_junction = None
+
+                    # Compute perpendicular profiles for this dataset
+                    if sem_data is None:
+                        print(f"Dataset {i} missing SEM data, skipping perpendiculars.")
+                        continue
+
+                    profiles = calculate_perpendicular_profiles(mapped_line, int(num_lines), float(length_um), sem_data, cur_data, pixel_size_m=ds.get('pixel_size', self.pixel_size), detected_junction=detected_junction, source_name=ds.get('sample_name'))
+
+                    # Plot & save profiles using shared utility (it saves PNG/CSV)
+                    try:
+                        plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=ds.get('sample_name'))
+                    except Exception as e:
+                        print(f"Failed to plot perpendiculars for dataset {i}: {e}")
+
+                except Exception as e:
+                    print(f"Failed perpendiculars for dataset {i}: {e}")
+
+            print("Saved perpendicular plots for all sweep datasets.")
+            # Also update in-memory perpendicular_profiles for the current viewer if available
+            try:
+                if getattr(self, 'sweep_perpendicular_profiles', None) is not None:
+                    # already stored by detection pass; nothing to change
+                    pass
+            except Exception:
+                pass
+            return
+
+        # === Calculate perpendicular profiles for current dataset ===
         profiles = self._calculate_perpendicular_profiles(num_lines, length_um, line_coords=self.line_coords)
 
         # === Plot perpendicular profiles ===
@@ -986,6 +1321,7 @@ class SEMViewer:
             best_result = results[0]
             detected_coords = best_result[1]
             self.detected_junction_line = detected_coords
+            self.detected_on_dataset_index = self.sweep_index if getattr(self, 'sweep_index', None) is not None else self.index
             # remove previous if present
             try:
                 if hasattr(self, 'detected_line_obj') and self.detected_line_obj is not None:
@@ -996,10 +1332,336 @@ class SEMViewer:
             except Exception:
                 pass
 
-            self.detected_line_obj = Line2D(self.detected_junction_line[:, 0], self.detected_junction_line[:, 1], color='green', linewidth=2)
+            # Map detected coords to currently displayed dataset coords
+            try:
+                mapped = self._get_displayed_detected_coords()
+                if mapped is None:
+                    mapped = self.detected_junction_line
+            except Exception:
+                mapped = self.detected_junction_line
+
+            self.detected_line_obj = Line2D(mapped[:, 0], mapped[:, 1], color='green', linewidth=2)
             self.ax.add_line(self.detected_line_obj)
             if hasattr(self, 'fig') and self.fig is not None:
                 self.fig.canvas.draw_idle()
+        except Exception:
+            pass
+    def _observe_detected_junction_button(self, event=None):
+        """Callback to sample SEM and EBIC along the detected junction and show plots."""
+        try:
+            if not hasattr(self, 'detected_junction_line') or self.detected_junction_line is None:
+                print("No detected junction available. Run detection first.")
+                return
+
+            # Map detected junction coordinates to coordinates of the currently displayed dataset
+            coords = self._get_displayed_detected_coords()
+            if coords is None:
+                coords = np.asarray(self.detected_junction_line)
+            else:
+                coords = np.asarray(coords)
+            if coords.size == 0:
+                print("Detected junction has no coordinates.")
+                return
+
+            # Ensure arrays of x and y
+            xs = coords[:, 0]
+            ys = coords[:, 1]
+
+            # Use the currently displayed SEM/pixel data (respect sweep/dataset switches)
+            sem_data = None
+            try:
+                sem_data = self.pixel_maps[self.index]
+            except Exception:
+                sem_data = None
+
+            if sem_data is None:
+                print("No SEM/pixel data available to sample.")
+                return
+
+            # Sample SEM and current along the detected coordinates from the currently displayed dataset
+            sem_vals = map_coordinates(sem_data, [ys, xs], order=1, mode='nearest')
+
+            cur_vals = None
+            try:
+                # Prefer processed current map if available (index 1), otherwise fallback to pixel_maps[1]
+                cur_map = None
+                if getattr(self, 'current_maps', None) is not None and len(self.current_maps) > 1 and self.current_maps[1] is not None:
+                    cur_map = self.current_maps[1]
+                elif len(self.pixel_maps) > 1 and self.pixel_maps[1] is not None:
+                    cur_map = self.pixel_maps[1]
+
+                if cur_map is not None:
+                    cur_vals = map_coordinates(cur_map, [ys, xs], order=1, mode='nearest')
+            except Exception:
+                cur_vals = None
+
+            # Compute distance along the detected line (in µm)
+            diffs = np.sqrt(np.sum(np.diff(coords, axis=0) ** 2, axis=1))
+            dists_px = np.concatenate(([0.0], np.cumsum(diffs)))
+            dists_um = dists_px * self.pixel_size * 1e6
+
+            # Normalize SEM for plotting
+            sem_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals) + 1e-12)
+
+            # Plot in a new figure (simple matplotlib window)
+            fig, ax1 = plt.subplots(figsize=(8, 4))
+            ax1.plot(dists_um, sem_norm, color='tab:blue', linewidth=2, label='SEM (norm)')
+            ax1.set_xlabel('Distance along junction (µm)')
+            ax1.set_ylabel('SEM (norm)', color='tab:blue')
+            ax1.tick_params(axis='y', labelcolor='tab:blue')
+
+            if cur_vals is not None:
+                ax2 = ax1.twinx()
+                ax2.plot(dists_um, cur_vals, color='tab:red', linewidth=1.5, label='Current (nA)')
+                ax2.set_ylabel('Current (nA)', color='tab:red')
+                ax2.tick_params(axis='y', labelcolor='tab:red')
+
+            ax1.set_title(f"{self.sample_name} - Along detected junction")
+            ax1.grid(True)
+            fig.tight_layout()
+            plt.show()
+        except Exception as e:
+            print(f"Failed to observe detected junction: {e}")
+    
+    def _apply_detection_to_sweep(self, event=None):
+        """Run junction detection and perpendicular profile calculation across all sweep datasets.
+
+        This transforms the manual line into each dataset using computed integer shifts,
+        extracts ROIs, runs JunctionAnalyzer.detect for each dataset with the current
+        EBIC weight, and computes perpendicular profiles (if user provides parameters).
+        Results are stored in self.sweep_detected_coords and self.sweep_perpendicular_profiles.
+        """
+        try:
+            if not getattr(self, 'sweep_datasets', None):
+                print("No sweep datasets available.")
+                return
+
+            # Determine the manual dense line to use
+            manual_dense = None
+            if getattr(self, '_last_manual_line_dense', None) is not None:
+                manual_dense = self._last_manual_line_dense
+            elif getattr(self, 'manual_line_dense', None) is not None:
+                manual_dense = self.manual_line_dense
+            else:
+                print("No manual line available. Draw a line first.")
+                return
+
+            # Determine half-width in pixels
+            half_width_px = getattr(self, '_last_half_width_px', None)
+            if half_width_px is None:
+                width_um = ask_junction_width()
+                if width_um is None:
+                    print("Operation canceled by user.")
+                    return
+                half_width_px = int(np.round(width_um * 1e-6 / self.pixel_size))
+                half_width_px = max(1, half_width_px)
+
+            # Ask perpendicular params (num lines and length)
+            from tkinter import Tk, simpledialog
+            root = Tk(); root.withdraw(); root.update()
+            try:
+                num_lines = simpledialog.askinteger("Input", "Number of perpendicular lines:", parent=root, minvalue=1, maxvalue=200)
+                length_um = simpledialog.askfloat("Input", "Length of each perpendicular line (µm):", parent=root, minvalue=0.1, maxvalue=1e5)
+            except Exception:
+                root.destroy()
+                print("Invalid input. Operation canceled.")
+                return
+            root.destroy()
+            if num_lines is None or length_um is None:
+                print("Operation canceled by user.")
+                return
+
+            n = len(self.sweep_datasets)
+            detected_list = [None] * n
+            perp_list = [None] * n
+
+            ref_idx = int(self.sweep_index) if self.sweep_index is not None else 0
+
+            print(f"Starting sweep detection on {n} datasets (ref idx {ref_idx})...")
+            for i, ds in enumerate(self.sweep_datasets):
+                try:
+                    pm_list = ds.get('pixel_maps', [])
+                    cm_list = ds.get('current_maps', [])
+                    if not pm_list:
+                        print(f"Dataset {i} missing pixel maps, skipping.")
+                        continue
+                    sem_data = pm_list[self.index] if (self.index is not None and self.index < len(pm_list)) else pm_list[0]
+
+                    # map manual dense line to this dataset coordinates using shifts
+                    if self.sweep_shifts is not None:
+                        sx_i, sy_i = self.sweep_shifts[i]
+                        sx_ref, sy_ref = self.sweep_shifts[ref_idx]
+                        dx = sx_i - sx_ref
+                        dy = sy_i - sy_ref
+                        mapped_dense = manual_dense + np.array([dx, dy])
+                    else:
+                        mapped_dense = manual_dense.copy()
+
+                    # Extract ROI for SEM and current (if present)
+                    roi, _ = extract_line_rectangle(sem_data, mapped_dense, half_width_px)
+                    roi_current = None
+                    try:
+                        if cm_list and len(cm_list) > 1 and cm_list[1] is not None:
+                            roi_current, _ = extract_line_rectangle(cm_list[1], mapped_dense, half_width_px)
+                    except Exception:
+                        roi_current = None
+
+                    analyzer = JunctionAnalyzer(pixel_size_m=ds.get('pixel_size', self.pixel_size))
+                    results = analyzer.detect(roi, mapped_dense, roi_current=roi_current, weight_current=self.ebic_weight)
+                    if results:
+                        best = results[0]
+                        # best is expected to be (label, coords, metrics)
+                        if isinstance(best, (list, tuple)) and len(best) >= 2:
+                            detected_coords = best[1]
+                        else:
+                            detected_coords = np.asarray(best)
+                        detected_list[i] = np.asarray(detected_coords)
+                        # Compute perpendicular profiles using detected junction as intersection reference
+                        try:
+                            profiles = calculate_perpendicular_profiles(mapped_dense, int(num_lines), float(length_um), sem_data, cm_list[1] if (cm_list and len(cm_list) > 1) else None, pixel_size_m=ds.get('pixel_size', self.pixel_size), detected_junction=detected_coords, source_name=ds.get('sample_name'))
+                            perp_list[i] = profiles
+                        except Exception as e:
+                            print(f"Failed to compute perpendiculars for dataset {i}: {e}")
+                    else:
+                        print(f"No detection result for dataset {i}.")
+                except Exception as e:
+                    print(f"Error processing dataset {i}: {e}")
+
+            # Persist results
+            self.sweep_detected_coords = detected_list
+            self.sweep_perpendicular_profiles = perp_list
+
+            # If current displayed dataset now has a detection, update the viewer's detected_junction_line
+            try:
+                cur_idx = int(self.sweep_index) if self.sweep_index is not None else 0
+                if 0 <= cur_idx < len(detected_list) and detected_list[cur_idx] is not None:
+                    self.detected_junction_line = detected_list[cur_idx]
+                    self.detected_on_dataset_index = cur_idx
+                # redraw
+                self._update_display()
+            except Exception:
+                pass
+
+            print("Sweep detection finished.")
+            # Optionally open debug view automatically if enabled
+            try:
+                if getattr(self, 'debug_mode', False):
+                    self._debug_show_sweep()
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Failed to run sweep detection: {e}")
+    
+    def _debug_show_sweep(self, event=None):
+        """Open a figure showing each sweep dataset image with detected junction and perpendiculars (if available)."""
+        try:
+            if not getattr(self, 'sweep_datasets', None):
+                print("No sweep datasets available for debug display.")
+                return
+
+            n = len(self.sweep_datasets)
+            if n == 0:
+                print("Sweep is empty.")
+                return
+
+            # layout
+            ncols = min(4, n)
+            nrows = int(np.ceil(n / ncols))
+            fig = plt.figure(figsize=(4 * ncols, 3 * nrows))
+
+            ref_idx = int(self.sweep_index) if self.sweep_index is not None else 0
+            for i, ds in enumerate(self.sweep_datasets):
+                ax = fig.add_subplot(nrows, ncols, i + 1)
+                pm = ds.get('pixel_maps', [])
+                if not pm:
+                    ax.set_title(f"Dataset {i}: no pixel map")
+                    continue
+                img = pm[0]
+                ax.imshow(img, cmap='gray', extent=[0, img.shape[1], img.shape[0], 0])
+                ax.set_xticks([]); ax.set_yticks([])
+                title = ds.get('sample_name', f'dataset_{i}')
+                ax.set_title(f"{i}: {title}")
+
+                # Draw the computed integer shift vector (relative to reference dataset)
+                try:
+                    if getattr(self, 'sweep_shifts', None) is not None and ref_idx is not None:
+                        sx_ref, sy_ref = self.sweep_shifts[ref_idx]
+                        sx_i, sy_i = self.sweep_shifts[i]
+                        ddx = sx_i - sx_ref
+                        ddy = sy_i - sy_ref
+                        # place the arrow near top-left of the image for visibility
+                        h, w = img.shape[0], img.shape[1]
+                        anchor_x = max(5, int(0.05 * w))
+                        anchor_y = max(5, int(0.05 * h))
+                        end_x = anchor_x + ddx
+                        end_y = anchor_y + ddy
+                        # draw arrow and text in yellow for contrast
+                        ax.annotate('', xy=(end_x, end_y), xytext=(anchor_x, anchor_y),
+                                    arrowprops=dict(arrowstyle='->', color='yellow', linewidth=1.5))
+                        ax.text(anchor_x, anchor_y + 12, f"shift: {ddx},{ddy}", color='yellow', fontsize=8, va='top')
+                except Exception:
+                    pass
+
+                # get detected coords for this dataset if available
+                det_coords = None
+                try:
+                    if getattr(self, 'sweep_detected_coords', None) is not None:
+                        det_coords = self.sweep_detected_coords[i]
+                except Exception:
+                    det_coords = None
+
+                # fallback: map global detected_junction_line to this dataset
+                if det_coords is None and getattr(self, 'detected_junction_line', None) is not None:
+                    try:
+                        # map from detected_on_dataset_index to i
+                        src_idx = getattr(self, 'detected_on_dataset_index', self.sweep_index)
+                        if self.sweep_shifts is not None and src_idx is not None:
+                            sx_i, sy_i = self.sweep_shifts[i]
+                            sx_s, sy_s = self.sweep_shifts[src_idx]
+                            dx = sx_i - sx_s
+                            dy = sy_i - sy_s
+                            det_coords = np.asarray(self.detected_junction_line) + np.array([dx, dy])
+                        else:
+                            det_coords = np.asarray(self.detected_junction_line)
+                    except Exception:
+                        det_coords = None
+
+                if det_coords is not None:
+                    try:
+                        ax.plot(det_coords[:, 0], det_coords[:, 1], color='lime', linewidth=2)
+                    except Exception:
+                        pass
+
+                # draw perpendiculars if available for this dataset
+                try:
+                    if getattr(self, 'sweep_perpendicular_profiles', None) is not None:
+                        profs = self.sweep_perpendicular_profiles[i]
+                        if profs:
+                            for prof in profs:
+                                p_start, p_end = prof.get('line_coords', (None, None))
+                                if p_start is not None and p_end is not None:
+                                    ax.plot([p_start[0], p_end[0]], [p_start[1], p_end[1]], 'r--', linewidth=0.8)
+                                inter = prof.get('intersection')
+                                if inter is not None:
+                                    ax.scatter(inter[0], inter[1], color='magenta', s=20, marker='x')
+                except Exception:
+                    pass
+
+            fig.tight_layout()
+            plt.show()
+        except Exception as e:
+            print(f"Failed to open debug sweep view: {e}")
+
+    def _toggle_debug_mode(self, event=None):
+        """Toggle debug mode on/off and update button label."""
+        try:
+            self.debug_mode = not getattr(self, 'debug_mode', False)
+            try:
+                if hasattr(self, 'b_debug_mode') and self.b_debug_mode is not None:
+                    self.b_debug_mode.label.set_text('Debug: ON' if self.debug_mode else 'Debug: OFF')
+            except Exception:
+                pass
+            print(f"Debug mode {'ON' if self.debug_mode else 'OFF'}")
         except Exception:
             pass
     
@@ -1041,6 +1703,7 @@ class SEMViewer:
             best_result = results[0]
             detected_coords = best_result[1]
             self.detected_junction_line = detected_coords
+            self.detected_on_dataset_index = self.sweep_index if getattr(self, 'sweep_index', None) is not None else self.index
 
             # remove previous detected line visualization if present
             try:
@@ -1052,7 +1715,14 @@ class SEMViewer:
             except Exception:
                 pass
 
-            self.detected_line_obj = Line2D(self.detected_junction_line[:, 0], self.detected_junction_line[:, 1], color='green', linewidth=2)
+            try:
+                mapped = self._get_displayed_detected_coords()
+                if mapped is None:
+                    mapped = self.detected_junction_line
+            except Exception:
+                mapped = self.detected_junction_line
+
+            self.detected_line_obj = Line2D(mapped[:, 0], mapped[:, 1], color='green', linewidth=2)
             try:
                 self.ax.add_line(self.detected_line_obj)
             except Exception:
