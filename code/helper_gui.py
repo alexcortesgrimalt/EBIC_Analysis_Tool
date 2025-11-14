@@ -317,109 +317,202 @@ def fit_perpendicular_profiles_linear(viewer):
         print("No perpendicular profiles available. Draw them first.")
         return None
 
-    results = []
+    # New workflow: use the DiffusionLengthExtractor linear fitting pipeline
+    # which already implements linear-on-ln fitting, tail-cut truncation and
+    # depletion-edge extraction. We will call the high-level method that
+    # processes all profiles and then build a concise per-profile summary
+    # containing left/right slopes (ln-domain), R² and the central non-linear
+    # width (depletion_width).
+    if not hasattr(viewer, "perpendicular_profiles") or not viewer.perpendicular_profiles:
+        print("No perpendicular profiles available. Draw them first.")
+        return None
+
     pixel_size = getattr(viewer, 'pixel_size', 1e-6)
     extractor = DiffusionLengthExtractor(pixel_size, smoothing_sigma=1)
+    extractor.load_profiles(viewer.perpendicular_profiles)
 
-    for prof in viewer.perpendicular_profiles:
-        profile_id = prof.get('id', None)
-        x = np.array(prof['dist_um'], dtype=float)
-        y = np.array(prof['current'], dtype=float)
+    # Run the linear fitting pipeline for all profiles
+    extractor.fit_all_profiles_linear()
 
-        # Determine intersection index if provided, otherwise use center (peak)
-        intersection_idx = prof.get('intersection_idx', None)
-        if intersection_idx is None:
-            intersection_idx = int(len(x) // 2)
+    summaries = []
+    # Ensure output dir for saved figures (matches other code)
+    out_dir = os.path.join(os.getcwd(), 'depletion_plots')
+    os.makedirs(out_dir, exist_ok=True)
 
-        # Baseline estimation: median of tail (last 10 points)
-        tail = y[-10:]
-        baseline = max(np.median(tail), 0.0)
+    for res in extractor.results:
+        profile_idx = res.get('Profile')
+        fit_sides = res.get('fit_sides', [])
+        depletion = res.get('depletion', {})
 
-        # Subtract baseline and floor small positives to allow natural log
-        y_corr = y - baseline
-        pos = y_corr[y_corr > 0]
-        if pos.size > 0:
-            floor = max(np.min(pos) * 0.1, 1e-12)
-        else:
-            floor = 1e-12
-        y_safe = np.maximum(y_corr, floor)
+        best_left = depletion.get('best_left_fit')
+        best_right = depletion.get('best_right_fit')
 
-        # Use extractor iterative linear routine but suppress its internal plotting
-        try:
-            sides = extractor.fit_profile_sides_iterative_linear(
-                x_vals=x, y_vals=y,
-                intersection_idx=intersection_idx,
-                profile_id=profile_id,
-                plot_left=False, plot_right=False,
-                max_iter=8, tol_factor=1.0
-            )
-        except Exception:
-            sides = []
+        left_slope = best_left.get('slope') if best_left is not None else None
+        left_r2 = best_left.get('r2') if best_left is not None else None
+        right_slope = best_right.get('slope') if best_right is not None else None
+        right_r2 = best_right.get('r2') if best_right is not None else None
 
-        # choose best left/right by R^2
-        left_candidates = [s for s in sides if 'Left' in s.get('side', '') and s.get('r2') is not None]
-        right_candidates = [s for s in sides if 'Right' in s.get('side', '') and s.get('r2') is not None]
-        best_left = max(left_candidates, key=lambda r: r['r2']) if left_candidates else None
-        best_right = max(right_candidates, key=lambda r: r['r2']) if right_candidates else None
+        left_start = depletion.get('left_start')
+        right_start = depletion.get('right_start')
+        depletion_width = depletion.get('depletion_width')
 
-        # Prepare results entry
-        results.append({
-            'id': profile_id,
-            'intersection_idx': intersection_idx,
-            'baseline': baseline,
-            'floor': floor,
-            'left_fit': best_left,
-            'right_fit': best_right,
-            'all_fits': sides
+        summaries.append({
+            'profile': profile_idx,
+            'left_slope': left_slope,
+            'left_r2': left_r2,
+            'right_slope': right_slope,
+            'right_r2': right_r2,
+            'left_start': left_start,
+            'right_start': right_start,
+            'depletion_width': depletion_width
         })
 
-        # Plot per-profile log10 plot with all tailcut fits (faint) and best fits highlighted
+        # Plot ln(current) with best linear fits and depletion markers
         try:
-            logy = np.log(y_safe)
+            profile_entry = extractor.profiles[profile_idx - 1]
+            x = np.array(profile_entry.get('dist_um', []), dtype=float)
+            y = np.array(profile_entry.get('current', []), dtype=float)
+            base_idx = int(np.argmax(y))
+            # Center x axis at the detected junction if available, otherwise at the peak
+            intersection_idx = profile_entry.get('intersection_idx', None)
+            if intersection_idx is not None and 0 <= int(intersection_idx) < len(x):
+                ref = float(x[int(intersection_idx)])
+                base_idx = int(intersection_idx)
+            else:
+                ref = float(x[base_idx])
+            # Build ln(current) consistent with the linear-fitting pipeline:
+            # do NOT subtract a global baseline here because the fitting
+            # truncation pipeline operates on positive values with a floor.
+            y_plot = extractor.apply_low_pass_filter(y, visualize=False)
+            pos = y_plot[y_plot > 0]
+            floor = max(np.min(pos) * 0.1, 1e-12) if pos.size > 0 else 1e-12
+            y_safe = np.maximum(y_plot, floor)
+            ln_y = np.log(y_safe)
+
             fig, ax = plt.subplots(figsize=(8, 4))
-            ax.plot(x, logy, 'k.-', lw=1.0, ms=4, label='ln(Current)')
+            x_plot = x - ref
+            ax.plot(x_plot, ln_y, 'k.-', label='ln(Current)')
 
-            # Plot all tailcut fits faintly in natural-log domain
-            for s in sides:
-                try:
-                    slope = float(s.get('slope'))
-                    intercept = float(s.get('intercept'))
-                    x_fit = np.array(s.get('x_vals', s.get('x', [])), dtype=float)
-                    # natural-log fit -> plotting in natural-log (no conversion)
-                    y_log_nat = slope * x_fit + intercept
-                    # For left-side fits, x_vals were measured positively from the side -> negate for plotting
-                    if 'Left' in s.get('side', ''):
-                        x_plot = -x_fit
-                        ax.plot(x_plot, y_log_nat, color='blue', alpha=0.25, linewidth=1)
-                    else:
-                        ax.plot(x_fit, y_log_nat, color='red', alpha=0.25, linewidth=1)
-                except Exception:
-                    continue
-
-            # Highlight best fits
+            # Overlay best-left/right fits (transform their fit_curves to plotting coords)
             if best_left is not None:
-                sx = np.array(best_left.get('x_vals', best_left.get('x', [])), dtype=float)
-                yln = best_left['slope'] * sx + best_left['intercept']
-                ax.plot(-sx, yln, 'b-', lw=2.2, label=f"Best Left (s={best_left['slope']:.3g}, R²={best_left['r2']:.2f})")
-            if best_right is not None:
-                sx = np.array(best_right.get('x_vals', best_right.get('x', [])), dtype=float)
-                yln = best_right['slope'] * sx + best_right['intercept']
-                ax.plot(sx, yln, 'r-', lw=2.2, label=f"Best Right (s={best_right['slope']:.3g}, R²={best_right['r2']:.2f})")
+                # map global_x_vals if present
+                if 'global_x_vals' in best_left:
+                    x_fit = np.array(best_left['global_x_vals'], dtype=float) - ref
+                    y_fit = np.log(np.maximum(np.array(best_left.get('fit_curve', [])), floor))
+                else:
+                    x_fit = -np.array(best_left.get('x_vals', []), dtype=float) - ref
+                    y_fit = np.array(best_left.get('slope', 0.0)) * np.array(best_left.get('x_vals', []), dtype=float) + best_left.get('intercept', 0.0)
+                ax.plot(x_fit, y_fit, 'b-', lw=2.0, label=f"Left fit (s={left_slope:.3g}, R²={left_r2:.2f})")
+                if left_start is not None:
+                    ax.axvline(left_start - ref, color='b', linestyle='--')
 
-            # Mark intersection (at x=0)
-            ax.axvline(0.0, color='lime', linestyle='--', alpha=0.7)
+            if best_right is not None:
+                if 'global_x_vals' in best_right:
+                    x_fit = np.array(best_right['global_x_vals'], dtype=float) - ref
+                    y_fit = np.log(np.maximum(np.array(best_right.get('fit_curve', [])), floor))
+                else:
+                    x_fit = np.array(best_right.get('x_vals', []), dtype=float) - ref
+                    y_fit = np.array(best_right.get('slope', 0.0)) * np.array(best_right.get('x_vals', []), dtype=float) + best_right.get('intercept', 0.0)
+                ax.plot(x_fit, y_fit, 'r-', lw=2.0, label=f"Right fit (s={right_slope:.3g}, R²={right_r2:.2f})")
+                if right_start is not None:
+                    ax.axvline(right_start - ref, color='r', linestyle='--')
+
+            # Shade depletion region
+            if left_start is not None and right_start is not None:
+                ax.axvspan(left_start - ref, right_start - ref, color='green', alpha=0.12)
 
             ax.set_xlabel('Distance (µm)')
             ax.set_ylabel('ln(Current)')
-            ax.set_title(f"Profile {profile_id if profile_id is not None else ''} - Linear fits on ln(Current)")
-            ax.grid(True, linestyle='--', alpha=0.5)
+            ax.set_title(f"Profile {profile_idx} — linear regimes and depletion width = {depletion_width if depletion_width is not None else float('nan'):.3g} µm")
             ax.legend(fontsize='small')
-            plt.tight_layout()
-            plt.show()
-        except Exception:
-            pass
+            ax.grid(True, linestyle='--', alpha=0.4)
+            fig.tight_layout()
+            # Save figure
+            try:
+                base = profile_entry.get('source_name', None) or f'profile_{profile_idx:02d}'
+                import re
+                base_safe = re.sub(r'[^A-Za-z0-9._-]', '_', str(base))
+                out_path = os.path.join(out_dir, f'{base_safe}_profile_{profile_idx:02d}_linear.png')
+                fig.savefig(out_path, dpi=200, bbox_inches='tight')
+                print(f"Saved linear fit plot to {out_path}")
+            except Exception:
+                pass
+            try:
+                plt.show()
+            except Exception:
+                pass
+            plt.close(fig)
+        except Exception as e:
+            # If any error occurs while preparing or plotting this profile, report and continue
+            print(f"Failed plotting profile {profile_idx}: {e}")
+            continue
 
-    return results
+    # Save summary CSV for all profiles
+    import csv
+    summary_path = os.path.join(out_dir, 'perp_linear_summary.csv')
+    try:
+        with open(summary_path, 'w', newline='') as cf:
+            writer = csv.writer(cf)
+            writer.writerow(['profile', 'left_slope', 'left_r2', 'right_slope', 'right_r2', 'left_start', 'right_start', 'depletion_width'])
+            for s in summaries:
+                writer.writerow([s['profile'], s['left_slope'], s['left_r2'], s['right_slope'], s['right_r2'], s['left_start'], s['right_start'], s['depletion_width']])
+        print(f"Saved linear fit summary to {summary_path}")
+    except Exception as e:
+        print(f"Failed to save linear summary CSV: {e}")
+
+    # Also print a human-readable table to the console for quick inspection
+    try:
+        _print_linear_summary_table(summaries)
+    except Exception as e:
+        print(f"Failed to print linear summary table: {e}")
+
+    return summaries
+
+
+def _print_linear_summary_table(summaries):
+    """Print an aligned table summary of linear fits to the console.
+
+    Columns: profile, left_slope, left_r2, right_slope, right_r2, left_start, right_start, depletion_width
+    """
+    if not summaries:
+        print("No summary data to print.")
+        return
+
+    # Define headers and column widths
+    headers = ["profile", "left_slope", "left_r2", "right_slope", "right_r2", "left_start(um)", "right_start(um)", "depletion_width(um)"]
+    col_w = [8, 12, 9, 12, 9, 15, 15, 18]
+
+    # Print header
+    hdr = "".join(h.center(w) for h, w in zip(headers, col_w))
+    sep = "".join('-' * w for w in col_w)
+    print('\nLinear-fit summary:')
+    print(sep)
+    print(hdr)
+    print(sep)
+
+    def fmt(x, prec=3):
+        if x is None:
+            return "-".rjust(12)
+        try:
+            return f"{float(x):.{prec}g}".rjust(12)
+        except Exception:
+            return str(x).rjust(12)
+
+    for s in summaries:
+        p = str(s.get('profile', '-'))
+        ls = fmt(s.get('left_slope'))
+        lr = fmt(s.get('left_r2'), prec=2)
+        rs = fmt(s.get('right_slope'))
+        rr = fmt(s.get('right_r2'), prec=2)
+        lstart = fmt(s.get('left_start'))
+        rstart = fmt(s.get('right_start'))
+        dw = fmt(s.get('depletion_width'))
+
+        row = p.center(col_w[0]) + ls.rjust(col_w[1]) + lr.rjust(col_w[2]) + rs.rjust(col_w[3]) + rr.rjust(col_w[4]) + lstart.rjust(col_w[5]) + rstart.rjust(col_w[6]) + dw.rjust(col_w[7])
+        print(row)
+
+    print(sep)
+    print()
 
 
 def detect_junction(viewer):

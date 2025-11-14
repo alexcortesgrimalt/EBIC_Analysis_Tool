@@ -140,22 +140,18 @@ class SEMViewer:
         img_height_frac = 1.0  # full height
         self.ax.set_position([0, 0, img_width_frac, img_height_frac])
 
-        # Button layout parameters (two-column layout) - tightened so both columns fit on screen
-        # Reduce spacing and button widths; compute columns from remaining side area
+        # Button layout parameters (two-column layout)
         spacing = 0.01
         button_h = 0.045
-        # available width at right side of image (leave small margins)
         side_width = max(0.10, 1.0 - img_width_frac - 3 * spacing)
-        # split into two columns (leave a spacing between them)
-        # leave a tiny margin and cap to a sensible max
         button_w = min(0.085, max(0.06, (side_width - spacing) / 2.0 - 0.005))
-        x_col1 = img_width_frac + spacing  # left column start
-        x_col2 = x_col1 + button_w + spacing  # right column start
-        # Vertical offset to shift the whole button column upward (fraction of figure height)
+        left_button_offset = -0.01
+        x_col1 = max(0.01, img_width_frac + spacing + left_button_offset)
+        x_col2 = x_col1 + button_w + spacing
         button_y_offset = 0.03
         y_start = 0.88 + button_y_offset
-        y1 = y_start  # left column y
-        y2 = y_start  # right column y
+        y1 = y_start
+        y2 = y_start
 
         # Left column buttons
         ax_overlay = self.fig.add_axes([x_col1, y1, button_w, button_h])
@@ -246,13 +242,11 @@ class SEMViewer:
         self.b_debug.on_clicked(self._debug_show_sweep)
         y2 -= (button_h + spacing)
 
-
         # Connect close event
         self.fig.canvas.mpl_connect('close_event', self._on_close)
 
         # If viewer was created with sweep datasets, add a small button to choose dataset
         if getattr(self, 'sweep_datasets', None) is not None and len(self.sweep_datasets) > 1:
-            # place at top of button columns (use column positions so it fits)
             top_h = 0.03
             ax_choose = self.fig.add_axes([x_col1, 0.95, button_w, top_h])
             self.b_choose = Button(ax_choose, 'Choose Dataset')
@@ -1032,7 +1026,13 @@ class SEMViewer:
 
                     # Plot & save profiles using shared utility (it saves PNG/CSV)
                     try:
-                        plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=ds.get('sample_name'))
+                        # If this dataset is the one currently displayed, draw overlays on the main viewer
+                        cur_display_idx = int(self.sweep_index) if getattr(self, 'sweep_index', None) is not None else 0
+                        if i == cur_display_idx and hasattr(self, 'ax') and hasattr(self, 'fig'):
+                            plot_perpendicular_profiles(profiles, ax=self.ax, fig=self.fig, source_name=ds.get('sample_name'))
+                        else:
+                            # just open/save the perpendicular plots for other datasets
+                            plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=ds.get('sample_name'))
                     except Exception as e:
                         print(f"Failed to plot perpendiculars for dataset {i}: {e}")
 
@@ -1087,10 +1087,24 @@ class SEMViewer:
         # Pick points along dense line
         distances = np.linspace(0, len(dense_line) - 1, num_lines).astype(int)
 
-        sem_data = self.pixel_maps[0]
-        current_data = self.current_maps[1]
-        if sem_data is None or current_data is None:
-            print("Missing SEM or current data.")
+        # Use the currently displayed SEM frame (respect self.index)
+        try:
+            sem_data = self.pixel_maps[self.index]
+        except Exception:
+            sem_data = self.pixel_maps[0] if self.pixel_maps else None
+
+        # Prefer processed current map (index 1) if present, otherwise fallback to pixel_maps[1]
+        current_data = None
+        try:
+            if getattr(self, 'current_maps', None) and len(self.current_maps) > 1 and self.current_maps[1] is not None:
+                current_data = self.current_maps[1]
+            elif len(self.pixel_maps) > 1 and self.pixel_maps[1] is not None:
+                current_data = self.pixel_maps[1]
+        except Exception:
+            current_data = None
+
+        if sem_data is None:
+            print("Missing SEM data.")
             return []
 
         profiles = []
@@ -1542,6 +1556,18 @@ class SEMViewer:
             except Exception:
                 pass
 
+            # Ensure the viewer.perpendicular_profiles is set to the profiles for the currently displayed dataset
+            try:
+                cur_idx = int(self.sweep_index) if self.sweep_index is not None else 0
+                if 0 <= cur_idx < len(perp_list) and perp_list[cur_idx] is not None:
+                    # store the current dataset's perpendiculars in the viewer attribute so fit functions find them
+                    self.perpendicular_profiles = perp_list[cur_idx]
+                else:
+                    # fallback to empty list
+                    self.perpendicular_profiles = []
+            except Exception:
+                self.perpendicular_profiles = []
+
             print("Sweep detection finished.")
             # Optionally open debug view automatically if enabled
             try:
@@ -1666,10 +1692,54 @@ class SEMViewer:
             pass
     
     def _fit_profiles(self, event=None):
-        fit_perpendicular_profiles(self)
+        # If sweep is loaded, run fitting for every dataset's perpendicular profiles
+        try:
+            if getattr(self, 'sweep_datasets', None) and getattr(self, 'sweep_perpendicular_profiles', None):
+                results_all = []
+                orig_profiles = getattr(self, 'perpendicular_profiles', None)
+                for i, profs in enumerate(self.sweep_perpendicular_profiles):
+                    if not profs:
+                        print(f"Skipping dataset {i} (no perpendiculars)")
+                        continue
+                    print(f"Fitting exponential profiles for dataset {i} ({self.sweep_datasets[i].get('sample_name',i)})...")
+                    # set current profiles so helper finds them
+                    self.perpendicular_profiles = profs
+                    try:
+                        res = fit_perpendicular_profiles(self)
+                        results_all.append((i, res))
+                    except Exception as e:
+                        print(f"Failed to fit profiles for dataset {i}: {e}")
+                # restore original profiles
+                self.perpendicular_profiles = orig_profiles
+                return results_all
+        except Exception:
+            pass
+
+        # fallback: fit on current viewer perpendicular_profiles
+        return fit_perpendicular_profiles(self)
 
     def _fit_profiles_linear(self, event=None):
-        fit_perpendicular_profiles_linear(self)
+        try:
+            if getattr(self, 'sweep_datasets', None) and getattr(self, 'sweep_perpendicular_profiles', None):
+                results_all = []
+                orig_profiles = getattr(self, 'perpendicular_profiles', None)
+                for i, profs in enumerate(self.sweep_perpendicular_profiles):
+                    if not profs:
+                        print(f"Skipping dataset {i} (no perpendiculars)")
+                        continue
+                    print(f"Fitting linear profiles for dataset {i} ({self.sweep_datasets[i].get('sample_name',i)})...")
+                    self.perpendicular_profiles = profs
+                    try:
+                        res = fit_perpendicular_profiles_linear(self)
+                        results_all.append((i, res))
+                    except Exception as e:
+                        print(f"Failed linear fit for dataset {i}: {e}")
+                self.perpendicular_profiles = orig_profiles
+                return results_all
+        except Exception:
+            pass
+
+        return fit_perpendicular_profiles_linear(self)
 
     def _update_detected_junction_with_weight(self):
         """Re-run junction detection on the last ROI using the current EBIC weight

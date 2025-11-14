@@ -252,6 +252,21 @@ class DiffusionLengthExtractor:
         if intersection_idx is None:
             intersection_idx = base_idx
 
+        # Reference zero for fitting/selection/clipping: prefer the detected
+        # `intersection_idx` (junction) when provided; otherwise use the peak.
+        ref = float(x_vals[intersection_idx]) if intersection_idx is not None else float(x_vals[base_idx])
+        # Reference zero for fitting/selection/clipping: prefer the detected
+        # `intersection_idx` (junction) when provided; otherwise use the peak.
+        ref = float(x_vals[intersection_idx]) if intersection_idx is not None else float(x_vals[base_idx])
+
+        # Reference zero for fitting/selection/clipping: prefer the detected
+        # `intersection_idx` (junction) when provided; otherwise use the peak.
+        ref = float(x_vals[intersection_idx]) if intersection_idx is not None else float(x_vals[base_idx])
+
+        # Reference zero for fitting/selection/clipping: prefer the detected
+        # `intersection_idx` (junction) when provided; otherwise use the peak.
+        ref = float(x_vals[intersection_idx]) if intersection_idx is not None else float(x_vals[base_idx])
+
         results = []
         tolerance = self.pixel_size * 1e6
 
@@ -347,7 +362,6 @@ class DiffusionLengthExtractor:
         # --- Choose best candidates by R² (and enforce side-start sign) ---
         best_left_idx = None
         if left_candidates:
-            ref = float(x_vals[base_idx])
             # prefer candidates whose start position is on the left side (<= ref)
             left_filtered = [(idx, f) for idx, f in left_candidates if float(x_vals[idx]) - ref <= 0]
             if left_filtered:
@@ -360,7 +374,6 @@ class DiffusionLengthExtractor:
 
         best_right_idx = None
         if right_candidates:
-            ref = float(x_vals[base_idx])
             right_filtered = [(idx, f) for idx, f in right_candidates if float(x_vals[idx]) - ref >= 0]
             if right_filtered:
                 best_right_idx = max(right_filtered, key=lambda t: t[1].get('r2', -np.inf))[0]
@@ -393,7 +406,7 @@ class DiffusionLengthExtractor:
                 # distances back to profile positions starting at the start_idx
                 global_x=left_x_raw[::-1][:cut_idx],
                 prevent_cross_peak=prevent_cross_peak,
-                ref=float(x_vals[base_idx])
+                ref=ref
             ))
 
         if best_right_idx is not None:
@@ -417,7 +430,7 @@ class DiffusionLengthExtractor:
                 shift=0, side="Right", profile_id=profile_id,
                 global_x=right_x_raw[:cut_idx],
                 prevent_cross_peak=prevent_cross_peak,
-                ref=float(x_vals[base_idx])
+                ref=ref
             ))
 
         # --- Visualization: only tail truncations ---
@@ -463,8 +476,9 @@ class DiffusionLengthExtractor:
                     y_plot = y_plot[order]
                 except Exception:
                     pass
+                r2_display = res.get('_r2_linear', res.get('r2', float('nan')))
                 plt.plot(x_plot, y_plot, lw=1.2,
-                         label=f"shift {res['shift']} (R²={res.get('r2', float('nan')):.2f})")
+                         label=f"shift {res['shift']} (R²={r2_display:.2f})")
 
         plt.xlabel("x (pixels)")
         plt.ylabel("Signal")
@@ -587,8 +601,11 @@ class DiffusionLengthExtractor:
             if depletion['depletion_width'] is None:
                 continue
 
-            x = np.array(self.profiles[profile_id - 1]['dist_um'])
-            y = np.array(self.profiles[profile_id - 1]['current'])
+            profile_entry = self.profiles[profile_id - 1]
+            x = np.array(profile_entry.get('dist_um', []))
+            y = np.array(profile_entry.get('current', []))
+            # attempt to fetch source name (file/stem) if available
+            source_name = profile_entry.get('source_name', None)
             # center x axis at profile peak so x=0 corresponds to max(y)
             base_idx = int(np.argmax(y))
             ref = float(x[base_idx])
@@ -653,7 +670,11 @@ class DiffusionLengthExtractor:
                 except Exception:
                     pass
 
-            ax.set_title(f"Profile {profile_id} – Depletion Width = {depletion['depletion_width']:.2f} µm")
+            # Include source name in title when available
+            if source_name:
+                ax.set_title(f"{os.path.splitext(os.path.basename(str(source_name)))[0]} - Profile {profile_id} – Depletion Width = {depletion['depletion_width']:.2f} µm")
+            else:
+                ax.set_title(f"Profile {profile_id} – Depletion Width = {depletion['depletion_width']:.2f} µm")
             ax.set_xlabel("Distance (µm)")
             ax.set_ylabel("Current (nA)")
             ax.legend()
@@ -664,7 +685,15 @@ class DiffusionLengthExtractor:
             try:
                 out_dir = os.path.join(os.getcwd(), 'depletion_plots')
                 os.makedirs(out_dir, exist_ok=True)
-                out_path = os.path.join(out_dir, f'profile_{profile_id:02d}_depletion.png')
+                # include source name in saved filename when available
+                if source_name:
+                    base = os.path.splitext(os.path.basename(str(source_name)))[0]
+                    # sanitize base
+                    import re
+                    base = re.sub(r'[^A-Za-z0-9._-]', '_', base)
+                    out_path = os.path.join(out_dir, f'{base}_profile_{profile_id:02d}_depletion.png')
+                else:
+                    out_path = os.path.join(out_dir, f'profile_{profile_id:02d}_depletion.png')
                 fig.savefig(out_path, dpi=200, bbox_inches='tight')
             except Exception:
                 out_path = None
@@ -676,7 +705,10 @@ class DiffusionLengthExtractor:
                 pass
             plt.close(fig)
             if out_path:
-                print(f"Saved depletion plot to {out_path}")
+                if source_name:
+                    print(f"Saved depletion plot to {out_path} (source: {source_name})")
+                else:
+                    print(f"Saved depletion plot to {out_path}")
 
     def apply_low_pass_filter(self, y_vals, cutoff_fraction=0.1, visualize=True):
         """
@@ -1095,6 +1127,24 @@ class DiffusionLengthExtractor:
                 ha="right", va="top", fontsize=9, color="gray"
             )
 
+            # Attempt to collect source names from the loaded profiles and display
+            try:
+                sources = []
+                for p in getattr(self, 'profiles', []) or []:
+                    s = p.get('source_name') if isinstance(p, dict) else None
+                    if s and s not in sources:
+                        sources.append(s)
+                if sources:
+                    if len(sources) == 1:
+                        src_text = f"Source: {os.path.splitext(os.path.basename(str(sources[0])))[0]}"
+                    else:
+                        # show up to first 3 names then ellipsize
+                        short = [os.path.splitext(os.path.basename(str(s)))[0] for s in sources[:3]]
+                        src_text = "Sources: " + ", ".join(short) + ("..." if len(sources) > 3 else "")
+                    ax.text(0.01, -0.25, src_text, transform=ax.transAxes, ha='left', va='top', fontsize=9, color='gray')
+            except Exception:
+                pass
+
             plt.title("Average Lengths Summary", fontsize=12, pad=12)
             plt.tight_layout()
             plt.show()
@@ -1440,6 +1490,15 @@ class DiffusionLengthExtractor:
             slope = float(p[0])
             intercept = float(p[1])
 
+            # Adjust slope sign so that returned 'slope' corresponds to
+            # the derivative d(ln y)/dx in the profile coordinate system
+            # (x increasing to the right). When we fit the left side we
+            # flipped the x-axis (x_for_fit = -x_arr), so the fitted
+            # slope `slope` is actually d(ln y)/d(-x) = -d(ln y)/dx. To
+            # provide a consistent convention for callers, invert the
+            # sign for left-side fits here.
+            slope_profile = -slope if 'Left' in side else slope
+
             # Evaluate fitted line in the fit domain (x_for_fit) and map
             # back to the returned local x ordering (x_arr). For left side
             # we fitted on -x_arr, so evaluate on -x_for_fit to get values
@@ -1461,7 +1520,7 @@ class DiffusionLengthExtractor:
             # the x-units (which here are µm when used as such). Convert
             # and quantize to pixel size for reporting, matching other
             # routines' behavior.
-            inv_lambda_um = np.inf if slope == 0 else 1.0 / abs(slope)
+            inv_lambda_um = np.inf if slope_profile == 0 else 1.0 / abs(slope_profile)
             pixel_size_um = self.pixel_size * 1e6
             if np.isfinite(inv_lambda_um) and pixel_size_um > 0:
                 inv_lambda = max(round(inv_lambda_um / pixel_size_um) * pixel_size_um, pixel_size_um)
@@ -1488,8 +1547,9 @@ class DiffusionLengthExtractor:
                 'y_vals': np.exp(logy_arr) + float(baseline),
                 'fit_curve': fit_curve_local,
                 'fit_curve_local': fit_curve_local,
-                'parameters': (slope, intercept),
-                'slope': slope,
+                # parameters returned in profile-coordinates: (slope_profile, intercept_profile)
+                'parameters': (slope_profile, intercept),
+                'slope': slope_profile,
                 'intercept': intercept,
                 'inv_lambda': inv_lambda,
                 'r2': r2
@@ -1590,7 +1650,9 @@ class DiffusionLengthExtractor:
         return results
 
     def fit_profile_sides_linear(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
-                                 plot_left=True, plot_right=True, prevent_cross_peak=False):
+                                 plot_left=False, plot_right=False, prevent_cross_peak=False,
+                                 use_window_search=True, min_window=20, max_window=80, max_search=20,
+                                 r2_threshold_window=0.75, min_inv_factor=0.2, max_inv_factor=500.0):
         """
         Same flow as fit_profile_sides but fits linear models on ln(current) for
         left and right sides. Uses the same shifting and tail-cut truncation logic.
@@ -1645,7 +1707,10 @@ class DiffusionLengthExtractor:
                 y_arr = np.array(left_y_truncated, dtype=float)
                 # estimate baseline from tail median of the truncated segment
                 tail_n = min(10, max(3, len(y_arr) // 5))
-                baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
+                if len(y_arr) <= max_window:
+                    baseline = 0.0
+                else:
+                    baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
                 # subtract baseline then floor small/negative residuals
                 y_corr = y_arr - baseline
                 pos = y_corr[y_corr > 0]
@@ -1663,6 +1728,300 @@ class DiffusionLengthExtractor:
                 )
                 if left_fit and left_fit.get('r2') is not None:
                     left_candidates.append((start_idx_left, left_fit))
+
+        # If requested, perform a local sliding-window search anchored at
+        # the detected junction to find small linear regimes close to the
+        # intersection. This handles short linear regions that long
+        # left-shift fits miss.
+        def _search_local_region(side, length_penalty=0.01):
+            best_candidate = None
+            ref_idx = int(intersection_idx) if intersection_idx is not None else base_idx
+            if side == 'Left':
+                # search starts moving left from junction (do not go right
+                # of the peak). Start at the intersection but cap at
+                # base_idx-1 so the left search remains strictly left of
+                # the profile maximum.
+                left_start = min(ref_idx, base_idx - 1)
+                start_range = range(left_start, max(left_start - max_search, 0) - 1, -1)
+            else:
+                # search starts moving right from a point *after* the
+                # peak (user-requested): ensure we begin no earlier than
+                # base_idx+1 so right fits are anchored after the maximum.
+                right_start = max(ref_idx, base_idx + 1)
+                start_range = range(right_start, min(right_start + max_search, n - 1) + 1)
+
+            for s in start_range:
+                try:
+                    if side == 'Left':
+                        left_x_raw = x_vals[:s + 1]
+                        y_left_raw = y_vals[:s + 1]
+                        y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
+                        y_left_flipped = y_left_filtered[::-1]
+                        try:
+                            start_pos_left = float(left_x_raw[-1])
+                            x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
+                        except Exception:
+                            x_left_flipped = np.abs(left_x_raw)[::-1]
+                        max_w = min(max_window, len(y_left_flipped))
+                        if max_w < min_window:
+                            continue
+                        # try a range of window sizes, prefer smallest window that meets threshold
+                        best_local = (None, -np.inf, None, -np.inf)  # (w, r2_lin, fit, score)
+                        for w in range(min_window, max_w + 1):
+                            x_win = x_left_flipped[:w]
+                            y_win = y_left_flipped[:w]
+                            y_arr = np.array(y_win, dtype=float)
+                            tail_n = min(10, max(3, len(y_arr) // 5))
+                            if len(y_arr) <= max_window:
+                                baseline = 0.0
+                            else:
+                                baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
+                            y_corr = y_arr - baseline
+                            pos = y_corr[y_corr > 0]
+                            # Require a reasonable fraction of the window to
+                            # be positive after baseline subtraction to avoid
+                            # floor-induced outliers that dominate the fit.
+                            # Also require the last point to be positive so
+                            # we don't fit across a region that already
+                            # reached the baseline (which produces extreme
+                            # floor values for the log transform).
+                            if pos.size < max(3, int(0.4 * len(y_arr))):
+                                continue
+                            floor = max(np.min(pos) * 1e-6, 1e-12)
+                            logy = np.log(np.maximum(y_corr, floor))
+                            fit = self._fit_linear_on_log(x=x_win, logy=logy, shift=0, side='Left', profile_id=profile_id, baseline=baseline)
+                            if fit is None:
+                                continue
+                            # compute linear-domain R² on y vs fit_curve_local
+                            try:
+                                y_true = np.exp(logy) + baseline
+                                y_fit = np.array(fit.get('fit_curve_local', []), dtype=float)
+                                r2_lin = self._calculate_r2(y_true, y_fit)
+                            except Exception:
+                                r2_lin = -np.inf
+                            score = (r2_lin - length_penalty * float(w))
+                            # Reject fits that imply an unphysically small
+                            # characteristic length (inv_lambda) which often
+                            # results from near-vertical slopes on tiny
+                            # windows. Enforce min/max acceptable inv_lambda
+                            try:
+                                pixel_size_um = self.pixel_size * 1e6
+                                inv_lambda = fit.get('inv_lambda', None)
+                            except Exception:
+                                pixel_size_um = self.pixel_size * 1e6
+                                inv_lambda = None
+                            # Allow more permissive lower bound by scaling the
+                            # pixel size. The default factor (0.2) permits
+                            # shorter characteristic lengths while still
+                            # protecting against extremely small / noisy
+                            # near-vertical fits. The upper bound remains
+                            # large by default.
+                            min_inv = float(min_inv_factor) * pixel_size_um
+                            max_inv = float(max_inv_factor) * pixel_size_um
+                            # If inv_lambda is None (unexpected), accept the
+                            # candidate so downstream logic can evaluate it.
+                            if inv_lambda is not None and np.isfinite(inv_lambda):
+                                if inv_lambda < min_inv or inv_lambda > max_inv:
+                                    continue
+                            if r2_lin > best_local[1] or score > best_local[3]:
+                                best_local = (w, r2_lin, fit, score)
+                            if r2_lin >= r2_threshold_window:
+                                # prefer the smallest window meeting threshold
+                                # but don't return immediately — record and
+                                # allow the search to continue so we can
+                                # compare other starts/windows and avoid
+                                # selecting a trivial tiny-window at the
+                                # junction.
+                                best_local = (w, r2_lin, fit, score)
+                                break
+                        # update global best if this start produced a good fit
+                        if best_local[3] > (best_candidate[3] if best_candidate else -np.inf):
+                            # store (s, w, fit, r2_lin, score)
+                            best_candidate = (s, best_local[0], best_local[2], best_local[1], best_local[3])
+                    else:
+                        right_x_raw = x_vals[s:]
+                        y_right_raw = y_vals[s:]
+                        y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
+                        cut = len(y_right_filtered)
+                        max_w = min(max_window, cut)
+                        if max_w < min_window:
+                            continue
+                        best_local = (None, -np.inf, None, -np.inf)
+                        try:
+                            start_pos_right = float(right_x_raw[0])
+                            x_right_local = (np.array(right_x_raw, dtype=float) - start_pos_right)
+                        except Exception:
+                            x_right_local = np.array(right_x_raw, dtype=float)
+                        for w in range(min_window, max_w + 1):
+                            x_win = x_right_local[:w]
+                            y_win = y_right_filtered[:w]
+                            y_arr = np.array(y_win, dtype=float)
+                            tail_n = min(10, max(3, len(y_arr) // 5))
+                            if len(y_arr) <= max_window:
+                                baseline = 0.0
+                            else:
+                                baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
+                            y_corr = y_arr - baseline
+                            pos = y_corr[y_corr > 0]
+                            if pos.size < max(3, int(0.6 * len(y_arr))) or y_corr[-1] <= 0:
+                                continue
+                            floor = max(np.min(pos) * 1e-6, 1e-12)
+                            logy = np.log(np.maximum(y_corr, floor))
+                            fit = self._fit_linear_on_log(x=x_win, logy=logy, shift=0, side='Right', profile_id=profile_id, baseline=baseline)
+                            if fit is None:
+                                continue
+                            try:
+                                y_true = np.exp(logy) + baseline
+                                y_fit = np.array(fit.get('fit_curve_local', []), dtype=float)
+                                r2_lin = self._calculate_r2(y_true, y_fit)
+                            except Exception:
+                                r2_lin = -np.inf
+                            score = (r2_lin - length_penalty * float(w))
+                            try:
+                                pixel_size_um = self.pixel_size * 1e6
+                                inv_lambda = fit.get('inv_lambda', None)
+                            except Exception:
+                                pixel_size_um = self.pixel_size * 1e6
+                                inv_lambda = None
+                            min_inv = float(min_inv_factor) * pixel_size_um
+                            max_inv = float(max_inv_factor) * pixel_size_um
+                            if inv_lambda is not None and np.isfinite(inv_lambda):
+                                if inv_lambda < min_inv or inv_lambda > max_inv:
+                                    continue
+                            if r2_lin > best_local[1] or score > best_local[3]:
+                                best_local = (w, r2_lin, fit, score)
+                            if r2_lin >= r2_threshold_window:
+                                best_local = (w, r2_lin, fit, score)
+                                break
+                        if best_local[3] > (best_candidate[3] if best_candidate else -np.inf):
+                            best_candidate = (s, best_local[0], best_local[2], best_local[1], best_local[3])
+                except Exception:
+                    continue
+            if best_candidate:
+                # Try to prefer a smaller window if a near-junction smaller
+                # window reaches a large fraction of the best R² found.
+                try:
+                    best_r2_overall = best_candidate[3]
+                    small_radius = min(6, max_search)
+                    # search small neighborhood near the junction for smaller windows
+                    ref_idx_local = int(intersection_idx) if intersection_idx is not None else base_idx
+                    neighborhood = range(ref_idx_local, max(ref_idx_local - small_radius, 0) - 1, -1) if side == 'Left' else range(ref_idx_local, min(ref_idx_local + small_radius, n - 1) + 1)
+                    for s2 in neighborhood:
+                        try:
+                            if side == 'Left':
+                                left_x_raw = x_vals[:s2 + 1]
+                                y_left_raw = y_vals[:s2 + 1]
+                                y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
+                                y_left_flipped = y_left_filtered[::-1]
+                                try:
+                                    start_pos_left = float(left_x_raw[-1])
+                                    x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
+                                except Exception:
+                                    x_left_flipped = np.abs(left_x_raw)[::-1]
+                                max_w2 = min(max_window, len(y_left_flipped))
+                                for w2 in range(min_window, max_w2 + 1):
+                                    x_win = x_left_flipped[:w2]
+                                    y_win = y_left_flipped[:w2]
+                                    y_arr = np.array(y_win, dtype=float)
+                                    tail_n = min(10, max(3, len(y_arr) // 5))
+                                    if len(y_arr) <= max_window:
+                                        baseline = 0.0
+                                    else:
+                                        baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
+                                    y_corr = y_arr - baseline
+                                    pos = y_corr[y_corr > 0]
+                                    if pos.size < max(3, int(0.4 * len(y_arr))):
+                                        continue
+                                    floor = max(np.min(pos) * 1e-6, 1e-12)
+                                    logy = np.log(np.maximum(y_corr, floor))
+                                    fit2 = self._fit_linear_on_log(x=x_win, logy=logy, shift=0, side='Left', profile_id=profile_id, baseline=baseline)
+                                    if fit2 is None:
+                                        continue
+                                    try:
+                                        y_true = np.exp(logy) + baseline
+                                        y_fit = np.array(fit2.get('fit_curve_local', []), dtype=float)
+                                        r2_lin2 = self._calculate_r2(y_true, y_fit)
+                                    except Exception:
+                                        r2_lin2 = -np.inf
+                                    if r2_lin2 >= 0.9 * best_r2_overall and w2 < best_candidate[1]:
+                                        return (s2, w2, fit2, r2_lin2)
+                            else:
+                                right_x_raw = x_vals[s2:]
+                                y_right_raw = y_vals[s2:]
+                                y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
+                                max_w2 = min(max_window, len(y_right_filtered))
+                                try:
+                                    start_pos_right = float(right_x_raw[0])
+                                    x_right_local = (np.array(right_x_raw, dtype=float) - start_pos_right)
+                                except Exception:
+                                    x_right_local = np.array(right_x_raw, dtype=float)
+                                for w2 in range(min_window, max_w2 + 1):
+                                    x_win = x_right_local[:w2]
+                                    y_win = y_right_filtered[:w2]
+                                    y_arr = np.array(y_win, dtype=float)
+                                    tail_n = min(10, max(3, len(y_arr) // 5))
+                                    if len(y_arr) <= max_window:
+                                        baseline = 0.0
+                                    else:
+                                        baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
+                                    y_corr = y_arr - baseline
+                                    pos = y_corr[y_corr > 0]
+                                    if pos.size < max(3, int(0.6 * len(y_arr))) or y_corr[-1] <= 0:
+                                        continue
+                                    floor = max(np.min(pos) * 1e-6, 1e-12)
+                                    logy = np.log(np.maximum(y_corr, floor))
+                                    fit2 = self._fit_linear_on_log(x=x_win, logy=logy, shift=0, side='Right', profile_id=profile_id, baseline=baseline)
+                                    if fit2 is None:
+                                        continue
+                                    try:
+                                        y_true = np.exp(logy) + baseline
+                                        y_fit = np.array(fit2.get('fit_curve_local', []), dtype=float)
+                                        r2_lin2 = self._calculate_r2(y_true, y_fit)
+                                    except Exception:
+                                        r2_lin2 = -np.inf
+                                    if r2_lin2 >= 0.9 * best_r2_overall and w2 < best_candidate[1]:
+                                        return (s2, w2, fit2, r2_lin2)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                return best_candidate
+            return None
+
+        # Run window search first if requested
+        if use_window_search:
+            left_win = _search_local_region('Left')
+            right_win = _search_local_region('Right')
+            if left_win is not None:
+                if len(left_win) == 5:
+                    s, w, fit, r2_lin, _score = left_win
+                else:
+                    s, w, fit, r2_lin = left_win
+                # attach some metadata and append
+                fit['side'] = f'Left-window(w={w})'
+                fit['_r2_linear'] = r2_lin
+                # global mapping: map to original coordinates
+                left_x_raw = x_vals[:s + 1]
+                # produce an ascending, properly ordered global x
+                # vector so plotting maps slopes in the right
+                # orientation.
+                gx = np.array(left_x_raw[::-1][:w], dtype=float)
+                fit['global_x_vals'] = np.sort(gx)
+                results.append(fit)
+            if right_win is not None:
+                if len(right_win) == 5:
+                    s, w, fit, r2_lin, _score = right_win
+                else:
+                    s, w, fit, r2_lin = right_win
+                fit['side'] = f'Right-window(w={w})'
+                fit['_r2_linear'] = r2_lin
+                right_x_raw = x_vals[s:]
+                fit['global_x_vals'] = np.array(right_x_raw[:w], dtype=float)
+                results.append(fit)
+            # If window search produced at least one windowed fit, prefer
+            # those and return early to avoid appending older long-tail fits.
+            if left_win is not None or right_win is not None:
+                return results
 
         # --- RIGHT side: find start index ---
         right_candidates = []
@@ -1700,66 +2059,197 @@ class DiffusionLengthExtractor:
                 if right_fit and right_fit.get('r2') is not None:
                     right_candidates.append((start_idx_right, right_fit))
 
-        # --- Choose best candidates by R² (and enforce side-start sign) ---
+        # If an explicit intersection_idx was provided and lies to the right
+        # of the peak, also try a left-side start exactly at the intersection
+        # so we have candidates anchored at the detected junction.
+        try:
+            if intersection_idx is not None and int(intersection_idx) > base_idx and int(intersection_idx) < len(x_vals):
+                start_idx_left = int(intersection_idx)
+                left_x_raw = x_vals[:start_idx_left + 1]
+                y_left_raw = y_vals[:start_idx_left + 1]
+                y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
+                y_left_flipped = y_left_filtered[::-1]
+                try:
+                    start_pos_left = float(left_x_raw[-1])
+                    x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
+                except Exception:
+                    x_left_flipped = np.abs(left_x_raw)[::-1]
+                cut_idx = self._find_snr_end_index(y_left_flipped)
+                left_y_truncated = y_left_flipped[:cut_idx]
+                left_x_truncated = x_left_flipped[:cut_idx]
+                if len(left_x_truncated) > 2:
+                    y_arr = np.array(left_y_truncated, dtype=float)
+                    tail_n = min(10, max(3, len(y_arr) // 5))
+                    baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
+                    y_corr = y_arr - baseline
+                    pos = y_corr[y_corr > 0]
+                    if pos.size > 0:
+                        floor = max(np.min(pos) * 1e-6, 1e-12)
+                    else:
+                        floor = 1e-12
+                    logy = np.log(np.maximum(y_corr, floor))
+                    left_fit = self._fit_linear_on_log(
+                        x=left_x_truncated, logy=logy,
+                        shift=0, side="Left", profile_id=profile_id,
+                        baseline=baseline
+                    )
+                    if left_fit and left_fit.get('r2') is not None:
+                        left_candidates.append((start_idx_left, left_fit))
+        except Exception:
+            pass
+        # If intersection_idx lies to the left of the peak, try a right-side
+        # start anchored at the intersection so right-side fits can be
+        # evaluated relative to the detected junction.
+        try:
+            if intersection_idx is not None and int(intersection_idx) < base_idx and int(intersection_idx) >= 0:
+                start_idx_right = int(intersection_idx)
+                right_x_raw = x_vals[start_idx_right:]
+                y_right_raw = y_vals[start_idx_right:]
+                y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
+                cut_idx = self._find_snr_end_index(y_right_filtered)
+                right_y_truncated = y_right_filtered[:cut_idx]
+                try:
+                    start_pos_right = float(right_x_raw[0])
+                    right_x_truncated = (np.array(right_x_raw, dtype=float) - start_pos_right)[:cut_idx]
+                except Exception:
+                    right_x_truncated = right_x_raw[:cut_idx]
+                if len(right_x_truncated) > 2:
+                    y_arr = np.array(right_y_truncated, dtype=float)
+                    tail_n = min(10, max(3, len(y_arr) // 5))
+                    baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
+                    y_corr = y_arr - baseline
+                    pos = y_corr[y_corr > 0]
+                    if pos.size > 0:
+                        floor = max(np.min(pos) * 1e-6, 1e-12)
+                    else:
+                        floor = 1e-12
+                    logy = np.log(np.maximum(y_corr, floor))
+                    right_fit = self._fit_linear_on_log(
+                        x=right_x_truncated, logy=logy,
+                        shift=0, side="Right", profile_id=profile_id,
+                        baseline=baseline
+                    )
+                    if right_fit and right_fit.get('r2') is not None:
+                        right_candidates.append((start_idx_right, right_fit))
+        except Exception:
+            pass
+
+        # --- Evaluate tail-fit results for each candidate and select by
+        # distance-to-junction (prefer close) but require a minimum R².
         best_left_idx = None
-        if left_candidates:
-            ref = float(x_vals[base_idx])
-            # prefer candidates whose start position is on the left side (<= ref)
-            left_filtered = [(idx, f) for idx, f in left_candidates if float(x_vals[idx]) - ref <= 0]
-            if left_filtered:
-                best_left_idx = max(left_filtered, key=lambda t: t[1].get('r2', -np.inf))[0]
-            else:
-                cand = max(left_candidates, key=lambda t: t[1].get('r2', -np.inf))
-                if float(x_vals[cand[0]]) - ref <= 0:
-                    best_left_idx = cand[0]
-
         best_right_idx = None
-        if right_candidates:
-            ref = float(x_vals[base_idx])
-            right_filtered = [(idx, f) for idx, f in right_candidates if float(x_vals[idx]) - ref >= 0]
-            if right_filtered:
-                best_right_idx = max(right_filtered, key=lambda t: t[1].get('r2', -np.inf))[0]
+
+        # Helper to compute tail-fit summary (best R²) for a candidate
+        def _candidate_tail_summary(side, start_idx):
+            try:
+                if side == 'Left':
+                    left_x_raw = x_vals[:start_idx + 1]
+                    y_left_raw = y_vals[:start_idx + 1]
+                    y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
+                    y_left_flipped = y_left_filtered[::-1]
+                    x_left_flipped = np.abs(left_x_raw)[::-1]
+                    cut_idx = self._find_snr_end_index(y_left_flipped)
+                    left_y_truncated = y_left_flipped[:cut_idx]
+                    left_x_truncated = x_left_flipped[:cut_idx]
+                    tail_results = self._truncate_tail_and_fit_linear(
+                        left_x_truncated, left_y_truncated,
+                        shift=0, side='Left', profile_id=profile_id,
+                        global_x=left_x_raw[::-1][:cut_idx],
+                        prevent_cross_peak=prevent_cross_peak,
+                        ref=(float(x_vals[intersection_idx]) if intersection_idx is not None else float(x_vals[base_idx]))
+                    )
+                else:
+                    right_x_raw = x_vals[start_idx:]
+                    y_right_raw = y_vals[start_idx:]
+                    y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
+                    cut_idx = self._find_snr_end_index(y_right_filtered)
+                    right_y_truncated = y_right_filtered[:cut_idx]
+                    try:
+                        start_pos_right = float(right_x_raw[0])
+                        right_x_truncated = (np.array(right_x_raw, dtype=float) - start_pos_right)[:cut_idx]
+                    except Exception:
+                        right_x_truncated = right_x_raw[:cut_idx]
+                    tail_results = self._truncate_tail_and_fit_linear(
+                        right_x_truncated, right_y_truncated,
+                        shift=0, side='Right', profile_id=profile_id,
+                        global_x=right_x_raw[:cut_idx],
+                        prevent_cross_peak=prevent_cross_peak,
+                        ref=(float(x_vals[intersection_idx]) if intersection_idx is not None else float(x_vals[base_idx]))
+                    )
+                # determine best R² among tail results. Use linear-domain
+                # R² (original y vs fitted curve) because log-domain R²
+                # can be misleading when baseline/subtraction or floors
+                # affect the log transform. Keep log-domain R² as well.
+                best_r2 = -np.inf
+                if tail_results:
+                    for f in tail_results:
+                        try:
+                            y_true = np.array(f.get('y_vals', []), dtype=float)
+                            y_fit = np.array(f.get('fit_curve_local', []), dtype=float)
+                            r2_lin = self._calculate_r2(y_true, y_fit)
+                        except Exception:
+                            r2_lin = -np.inf
+                        # store linear r2 for later inspection
+                        f['_r2_linear'] = r2_lin
+                        f['r2_linear'] = r2_lin
+                        # prefer linear-domain R² for selection
+                        if r2_lin is not None and r2_lin > best_r2:
+                            best_r2 = r2_lin
+                return tail_results, best_r2
+            except Exception:
+                return [], -np.inf
+
+        ref_val = (float(x_vals[intersection_idx]) if intersection_idx is not None else float(x_vals[base_idx]))
+
+        # Evaluate left candidates' tail fits
+        left_candidate_summaries = {}
+        for start_idx, _ in left_candidates:
+            tail_results, best_r2 = _candidate_tail_summary('Left', start_idx)
+            left_candidate_summaries[start_idx] = {'tail_results': tail_results, 'best_r2': best_r2}
+
+        # Evaluate right candidates' tail fits
+        right_candidate_summaries = {}
+        for start_idx, _ in right_candidates:
+            tail_results, best_r2 = _candidate_tail_summary('Right', start_idx)
+            right_candidate_summaries[start_idx] = {'tail_results': tail_results, 'best_r2': best_r2}
+
+        # Selection policy: prefer nearest-to-junction candidate among those
+        # with r2 >= threshold; fallback to highest-r2 candidate if none.
+        r2_threshold = 0.85
+
+        if left_candidate_summaries:
+            # candidates on left side (start <= ref_val)
+            left_filtered = {idx: v for idx, v in left_candidate_summaries.items() if float(x_vals[idx]) - ref_val <= 0}
+            if left_filtered:
+                good = [(idx, v) for idx, v in left_filtered.items() if v['best_r2'] >= r2_threshold]
+                if good:
+                    best_left_idx = min(good, key=lambda t: abs(float(x_vals[t[0]]) - ref_val))[0]
+                else:
+                    # choose candidate with max r2 among left_filtered
+                    best_left_idx = max(left_filtered.items(), key=lambda t: t[1]['best_r2'])[0]
             else:
-                cand = max(right_candidates, key=lambda t: t[1].get('r2', -np.inf))
-                if float(x_vals[cand[0]]) - ref >= 0:
-                    best_right_idx = cand[0]
+                # fallback: choose best overall left candidate by r2
+                best_left_idx = max(left_candidate_summaries.items(), key=lambda t: t[1]['best_r2'])[0]
 
-        # --- Tail truncations with fixed start indices ---
+        if right_candidate_summaries:
+            right_filtered = {idx: v for idx, v in right_candidate_summaries.items() if float(x_vals[idx]) - ref_val >= 0}
+            if right_filtered:
+                good = [(idx, v) for idx, v in right_filtered.items() if v['best_r2'] >= r2_threshold]
+                if good:
+                    best_right_idx = min(good, key=lambda t: abs(float(x_vals[t[0]]) - ref_val))[0]
+                else:
+                    best_right_idx = max(right_filtered.items(), key=lambda t: t[1]['best_r2'])[0]
+            else:
+                best_right_idx = max(right_candidate_summaries.items(), key=lambda t: t[1]['best_r2'])[0]
+
+        # Append the selected candidates' tail-fit results to final results
         if best_left_idx is not None:
-            left_x_raw = x_vals[:best_left_idx + 1]
-            y_left_raw = y_vals[:best_left_idx + 1]
-            y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-            y_left_flipped = y_left_filtered[::-1]
-            x_left_flipped = np.abs(left_x_raw)[::-1]
-
-            cut_idx = self._find_snr_end_index(y_left_flipped)
-            left_y_truncated = y_left_flipped[:cut_idx]
-            left_x_truncated = x_left_flipped[:cut_idx]
-
-            results.extend(self._truncate_tail_and_fit_linear(
-                left_x_truncated, left_y_truncated,
-                shift=0, side="Left", profile_id=profile_id,
-                global_x=left_x_raw[::-1][:cut_idx],
-                prevent_cross_peak=prevent_cross_peak,
-                ref=float(x_vals[base_idx])
-            ))
-
+            results.extend(left_candidate_summaries.get(best_left_idx, {}).get('tail_results', []))
         if best_right_idx is not None:
-            right_x_raw = x_vals[best_right_idx:]
-            y_right_raw = y_vals[best_right_idx:]
-            y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
+            results.extend(right_candidate_summaries.get(best_right_idx, {}).get('tail_results', []))
 
-            cut_idx = self._find_snr_end_index(y_right_filtered)
-            right_y_truncated = y_right_filtered[:cut_idx]
-            right_x_truncated = right_x_raw[:cut_idx]
-
-            results.extend(self._truncate_tail_and_fit_linear(
-                right_x_truncated, right_y_truncated,
-                shift=0, side="Right", profile_id=profile_id,
-                global_x=right_x_raw[:cut_idx],
-                prevent_cross_peak=prevent_cross_peak,
-                ref=float(x_vals[base_idx])
-            ))
+        # tail-fitting results for selected candidates were already
+        # computed above and appended to `results`.
 
         # --- Visualization: only tail truncations ---
         if plot_left and best_left_idx is not None:
@@ -1770,7 +2260,7 @@ class DiffusionLengthExtractor:
         return results
 
     def fit_profile_sides_iterative_linear(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
-                                           plot_left=True, plot_right=True, max_iter=10, tol_factor=1.0):
+                                           plot_left=False, plot_right=False, max_iter=10, tol_factor=1.0):
         """
         Iterative linear-on-log version of fit_profile_sides_iterative.
         """

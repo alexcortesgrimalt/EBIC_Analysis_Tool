@@ -97,14 +97,26 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
             if prof.get('intersection') is not None:
                 inter = prof['intersection']
                 ax.scatter(inter[0], inter[1], color='lime', s=50, marker='x', zorder=20)
-        fig.canvas.draw_idle()
+        try:
+            fig.canvas.draw_idle()
+            # force immediate draw in some backends where idle draw doesn't update
+            fig.canvas.draw()
+        except Exception:
+            pass
 
     # Plot each perpendicular profile
     import tkinter as tk
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     import os
     win = tk.Toplevel()
-    win.title("Perpendicular Profiles")
+    # Display source name in window title if available
+    display_name = source_name
+    if not display_name and profiles and isinstance(profiles, list) and profiles[0].get('source_name'):
+        display_name = profiles[0].get('source_name')
+    if display_name:
+        win.title(f"Perpendicular Profiles - {os.path.splitext(os.path.basename(str(display_name)))[0]}")
+    else:
+        win.title("Perpendicular Profiles")
     win.geometry("1200x800")
     canvas = tk.Canvas(win); scrollbar = tk.Scrollbar(win, orient="vertical", command=canvas.yview)
     scroll_frame = tk.Frame(canvas)
@@ -148,6 +160,12 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
             ax1b.scatter(dist_um[idx], cur[idx], color='lime', s=50, marker='x', zorder=10)
             ax_log.scatter(dist_um[idx], cur_safe[idx], color='lime', s=50, marker='x', zorder=10)
 
+        # include source name in subplot title for clarity
+        if prof.get('source_name'):
+            ax1.set_title(f"{os.path.splitext(os.path.basename(str(prof.get('source_name'))))[0]} - Perpendicular {prof['id']+1}")
+        else:
+            ax1.set_title(f"Perpendicular {prof['id']+1}")
+
         ax1.set_ylabel("SEM Contrast (norm)", color='tab:blue')
         ax1b.set_ylabel("Current (nA)", color='tab:red')
         ax_log.set_xlabel("Distance (µm)")
@@ -186,7 +204,7 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
                         break
             if base_name:
                 # use only the file stem and sanitize
-                base_name = os.path.splitext(os.path.basename(base_name))[0]
+                base_name = os.path.splitext(os.path.basename(str(base_name)))[0]
                 # replace spaces with underscores and remove path chars
                 import re
                 base_name = re.sub(r'[^A-Za-z0-9._-]', '_', base_name)
