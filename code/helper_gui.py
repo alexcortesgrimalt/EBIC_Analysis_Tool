@@ -10,13 +10,14 @@ import sys
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 from matplotlib.lines import Line2D
 from scipy.ndimage import map_coordinates
 
 from .DiffLenExt import DiffusionLengthExtractor
 from .Junction_Analyser import JunctionAnalyzer
 from .ROI_extractor import extract_line_rectangle
-from .perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles
+from .perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles, gradient_with_window
 
 def ask_junction_width():
     """
@@ -40,51 +41,23 @@ def ask_junction_width():
     finally:
         root.destroy()
     return width_um
+    
 
-
-def ask_junction_weight():
+def _maybe_close(fig):
     """
-    Show dialog to ask for EBIC weight to combine with SEM gradient.
-
-    Returns:
-        float: weight multiplier for EBIC gradients, or None if cancelled
+    Close a matplotlib figure only when running in a non-interactive / headless
+    backend (e.g. 'Agg') or when matplotlib is not in interactive mode.
     """
-    root = tk.Tk()
-    root.withdraw()
-    root.update()
     try:
-        weight = simpledialog.askfloat(
-            "EBIC Weight",
-            "Weight applied to EBIC/current gradient (0 = ignore EBIC, 10 advised):",
-            minvalue=0.0,
-            parent=root
-        )
+        backend = mpl.get_backend().lower()
+        # Only auto-close when backend is clearly headless (Agg).
+        if backend.startswith('agg'):
+            plt.close(fig)
     except Exception:
-        weight = None
-    finally:
-        root.destroy()
-    return weight
-
-def safe_remove_colorbar(viewer):
-    """
-    Safely remove colorbar from viewer if it exists.
-    
-    Args:
-        viewer: SEMViewer instance
-    """
-    if getattr(viewer, 'cbar', None):
         try:
-            viewer.cbar.remove()
+            plt.close(fig)
         except Exception:
             pass
-        viewer.cbar = None
-    
-    if getattr(viewer, 'cbar_ax', None):
-        try:
-            viewer.cbar_ax.remove()
-        except Exception:
-            pass
-        viewer.cbar_ax = None
 
 
 def draw_scalebar(ax, pixel_size, length_um=1.0, height_px=5, color='white', font_size=12):
@@ -150,6 +123,59 @@ def extract_line_profile_data(line_coords, data_array, pixel_size):
     distances_um = np.linspace(0, (length - 1) * pixel_size * 1e6, length)
     
     return distances_um, profile_values
+
+
+def ask_junction_weight():
+    """
+    Show dialog to ask for EBIC weight used in junction detection.
+
+    Returns:
+        float: EBIC weight value or None if cancelled
+    """
+    root = tk.Tk()
+    root.withdraw()
+    root.update()
+    try:
+        weight = simpledialog.askfloat(
+            "EBIC Weight",
+            "Weight for EBIC influence in junction detection:",
+            minvalue=0.1,
+            initialvalue=10.0,
+            parent=root
+        )
+    except Exception:
+        weight = None
+    finally:
+        root.destroy()
+    return weight
+
+
+def safe_remove_colorbar(viewer):
+    """
+    Safely remove the colorbar associated with a viewer (if any).
+
+    This handles both the Colorbar instance (`viewer.cbar`) and the
+    dedicated axes (`viewer.cbar_ax`) that may have been created.
+    """
+    try:
+        if getattr(viewer, 'cbar', None) is not None:
+            try:
+                viewer.cbar.remove()
+            except Exception:
+                pass
+            viewer.cbar = None
+    except Exception:
+        pass
+
+    try:
+        if getattr(viewer, 'cbar_ax', None) is not None:
+            try:
+                viewer.cbar_ax.remove()
+            except Exception:
+                pass
+            viewer.cbar_ax = None
+    except Exception:
+        pass
 
 
 def plot_line_profile(viewer):
@@ -269,7 +295,7 @@ def save_line_profile_plot(viewer, save_root):
         f"{viewer.sample_name}_frame{viewer.index + 1}_line_profile.png"
     )
     fig.savefig(profile_save_path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    _maybe_close(fig)
     print(f"Saved line profile plot to {profile_save_path}")
 
 
@@ -380,16 +406,15 @@ def fit_perpendicular_profiles_linear(viewer):
                 base_idx = int(intersection_idx)
             else:
                 ref = float(x[base_idx])
-            # Build ln(current) consistent with the linear-fitting pipeline:
-            # do NOT subtract a global baseline here because the fitting
-            # truncation pipeline operates on positive values with a floor.
-            y_plot = extractor.apply_low_pass_filter(y, visualize=False)
-            pos = y_plot[y_plot > 0]
+            # Build ln(current) - NO FILTERING, use raw data
+            # Use raw data directly to see true signal characteristics
+            pos = y[y > 0]
             floor = max(np.min(pos) * 0.1, 1e-12) if pos.size > 0 else 1e-12
-            y_safe = np.maximum(y_plot, floor)
+            y_safe = np.maximum(y, floor)
             ln_y = np.log(y_safe)
 
-            fig, ax = plt.subplots(figsize=(8, 4))
+            # Create a 2-row figure: top = ln(Current) and fits, bottom = derivatives
+            fig, (ax, ax_der) = plt.subplots(2, 1, sharex=True, figsize=(8, 6), gridspec_kw={'height_ratios': [2, 1]})
             x_plot = x - ref
             ax.plot(x_plot, ln_y, 'k.-', label='ln(Current)')
 
@@ -398,7 +423,11 @@ def fit_perpendicular_profiles_linear(viewer):
                 # map global_x_vals if present
                 if 'global_x_vals' in best_left:
                     x_fit = np.array(best_left['global_x_vals'], dtype=float) - ref
-                    y_fit = np.log(np.maximum(np.array(best_left.get('fit_curve', [])), floor))
+                    # Use ln_fit_curve if available (plateau method), otherwise compute from fit_curve
+                    if 'ln_fit_curve' in best_left:
+                        y_fit = np.array(best_left['ln_fit_curve'], dtype=float)
+                    else:
+                        y_fit = np.log(np.maximum(np.array(best_left.get('fit_curve', [])), floor))
                 else:
                     x_fit = -np.array(best_left.get('x_vals', []), dtype=float) - ref
                     y_fit = np.array(best_left.get('slope', 0.0)) * np.array(best_left.get('x_vals', []), dtype=float) + best_left.get('intercept', 0.0)
@@ -409,7 +438,11 @@ def fit_perpendicular_profiles_linear(viewer):
             if best_right is not None:
                 if 'global_x_vals' in best_right:
                     x_fit = np.array(best_right['global_x_vals'], dtype=float) - ref
-                    y_fit = np.log(np.maximum(np.array(best_right.get('fit_curve', [])), floor))
+                    # Use ln_fit_curve if available (plateau method), otherwise compute from fit_curve
+                    if 'ln_fit_curve' in best_right:
+                        y_fit = np.array(best_right['ln_fit_curve'], dtype=float)
+                    else:
+                        y_fit = np.log(np.maximum(np.array(best_right.get('fit_curve', [])), floor))
                 else:
                     x_fit = np.array(best_right.get('x_vals', []), dtype=float) - ref
                     y_fit = np.array(best_right.get('slope', 0.0)) * np.array(best_right.get('x_vals', []), dtype=float) + best_right.get('intercept', 0.0)
@@ -420,12 +453,99 @@ def fit_perpendicular_profiles_linear(viewer):
             # Shade depletion region
             if left_start is not None and right_start is not None:
                 ax.axvspan(left_start - ref, right_start - ref, color='green', alpha=0.12)
+            
+            # Highlight detected plateau regions (if available)
+            if best_left is not None and 'plateau_indices' in best_left:
+                idx_start, idx_end = best_left['plateau_indices']
+                if idx_start < len(x) and idx_end <= len(x):
+                    plat_x_start = x[idx_start] - ref
+                    plat_x_end = x[idx_end - 1] - ref
+                    ax.axvspan(plat_x_start, plat_x_end, color='blue', alpha=0.08, label='Left plateau region')
+            
+            if best_right is not None and 'plateau_indices' in best_right:
+                idx_start, idx_end = best_right['plateau_indices']
+                if idx_start < len(x) and idx_end <= len(x):
+                    plat_x_start = x[idx_start] - ref
+                    plat_x_end = x[idx_end - 1] - ref
+                    ax.axvspan(plat_x_start, plat_x_end, color='red', alpha=0.08, label='Right plateau region')
 
             ax.set_xlabel('Distance (µm)')
             ax.set_ylabel('ln(Current)')
             ax.set_title(f"Profile {profile_idx} — linear regimes and depletion width = {depletion_width if depletion_width is not None else float('nan'):.3g} µm")
             ax.legend(fontsize='small')
             ax.grid(True, linestyle='--', alpha=0.4)
+
+            # --- Derivative panel: d(lnI)/dx ---
+            # Use windowed gradient for smoother derivatives
+            gradient_window = 9
+            try:
+                x_vals_plot = np.array(x_plot, dtype=float)
+                if x_vals_plot.size > 1:
+                    dln_meas = gradient_with_window(x_vals_plot, ln_y, window=gradient_window)
+                else:
+                    dln_meas = np.zeros_like(x_vals_plot)
+            except Exception:
+                dln_meas = np.zeros_like(x_plot)
+
+            ax_der.plot(x_plot, dln_meas, color='tab:gray', linestyle=':', label='dlnI/dx (meas)')
+
+            # Overlay fit-derived dlnI/dx when available (from best_left/best_right)
+            try:
+                # helper to map fit arrays to plotting coordinates
+                def _get_fit_derivative_mapped(fit_dict, side):
+                    if fit_dict is None:
+                        return None, None
+                    # attempt to read global_x_vals first
+                    if 'global_x_vals' in fit_dict:
+                        fx = np.array(fit_dict['global_x_vals'], dtype=float) - ref
+                    elif 'global_x' in fit_dict:
+                        fx = np.array(fit_dict['global_x'], dtype=float) - ref
+                    else:
+                        # left-side stored x_vals are distances from left edge; mirror for plotting
+                        if side == 'Left':
+                            fx = -np.array(fit_dict.get('x_vals', []), dtype=float) - ref
+                        else:
+                            fx = np.array(fit_dict.get('x_vals', []), dtype=float) - ref
+
+                    # derivative arrays - use windowed gradient
+                    if 'fit_dlnI_dx' in fit_dict:
+                        fdln = np.array(fit_dict['fit_dlnI_dx'], dtype=float)
+                    else:
+                        # try compute from fit_curve using windowed gradient
+                        fc = np.array(fit_dict.get('fit_curve', []), dtype=float)
+                        if fx.size > 1 and fc.size == fx.size:
+                            try:
+                                fdln = gradient_with_window(fx + ref, np.log(np.maximum(fc, 1e-12)), window=gradient_window)
+                            except Exception:
+                                fdln = None
+                        else:
+                            fdln = None
+                    return fx, fdln
+
+                left_fx, left_fdln = _get_fit_derivative_mapped(best_left, 'Left')
+                right_fx, right_fdln = _get_fit_derivative_mapped(best_right, 'Right')
+
+                # Plot derivatives directly (NO INTERPOLATION)
+                if left_fx is not None and left_fdln is not None:
+                    # sort
+                    si = np.argsort(left_fx)
+                    lf = left_fx[si]
+                    ld = left_fdln[si]
+                    # Plot directly without interpolation
+                    ax_der.plot(lf, ld, 'b-', lw=1.6, label='dlnI/dx (left fit)')
+                if right_fx is not None and right_fdln is not None:
+                    si = np.argsort(right_fx)
+                    rf = right_fx[si]
+                    rd = right_fdln[si]
+                    # Plot directly without interpolation
+                    ax_der.plot(rf, rd, 'r-', lw=1.6, label='dlnI/dx (right fit)')
+            except Exception:
+                pass
+
+            ax_der.set_xlabel('Distance (µm)')
+            ax_der.set_ylabel('dlnI/dx (1/µm)')
+            ax_der.grid(True, linestyle='--', alpha=0.4)
+            ax_der.legend(fontsize='small')
             fig.tight_layout()
             # Save figure
             try:
@@ -441,7 +561,7 @@ def fit_perpendicular_profiles_linear(viewer):
                 plt.show()
             except Exception:
                 pass
-            plt.close(fig)
+            _maybe_close(fig)
         except Exception as e:
             # If any error occurs while preparing or plotting this profile, report and continue
             print(f"Failed plotting profile {profile_idx}: {e}")

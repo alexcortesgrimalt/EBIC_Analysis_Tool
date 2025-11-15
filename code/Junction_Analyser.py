@@ -1,6 +1,7 @@
 
 import numpy as np
 import cv2
+import matplotlib as mpl
 from scipy.interpolate import interp1d, splrep, splev
 from scipy.stats import pearsonr
 
@@ -510,7 +511,15 @@ class JunctionAnalyzer:
                     axw.legend(fontsize='small')
                     plt.tight_layout()
                     figw.savefig(fname, dpi=200)
-                    plt.close(figw)
+                    try:
+                        backend = mpl.get_backend().lower()
+                        if backend.startswith('agg') or not plt.isinteractive():
+                            plt.close(figw)
+                    except Exception:
+                        try:
+                            plt.close(figw)
+                        except Exception:
+                            pass
                     print(f"[visualize_weight_sweep] saved per-weight image: {fname}")
                 except Exception as e:
                     print(f"[visualize_weight_sweep] failed to save per-weight image for weight={w}: {e}")
@@ -590,7 +599,15 @@ class JunctionAnalyzer:
                 if show:
                     plt.show()
                 else:
-                    plt.close(fig_e)
+                    try:
+                        backend = mpl.get_backend().lower()
+                        if backend.startswith('agg') or not plt.isinteractive():
+                            plt.close(fig_e)
+                    except Exception:
+                        try:
+                            plt.close(fig_e)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -605,7 +622,15 @@ class JunctionAnalyzer:
         if show:
             plt.show()
         else:
-            plt.close(fig)
+            try:
+                backend = mpl.get_backend().lower()
+                if backend.startswith('agg') or not plt.isinteractive():
+                    plt.close(fig)
+            except Exception:
+                try:
+                    plt.close(fig)
+                except Exception:
+                    pass
 
         return results
 

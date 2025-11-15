@@ -3,6 +3,48 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 import matplotlib.pyplot as plt
 
+
+def gradient_with_window(x, y, window=9):
+    """
+    Compute gradient using a moving window with linear fit.
+    This provides smoother derivatives than np.gradient by fitting
+    a line to a local window around each point.
+    
+    Parameters
+    ----------
+    x : array-like
+        x coordinates (must be 1D)
+    y : array-like
+        y values (must be 1D, same length as x)
+    window : int, optional
+        Window size (must be odd). Larger values give smoother derivatives.
+        Default is 7.
+    
+    Returns
+    -------
+    dy : ndarray
+        Derivative dy/dx computed via local linear fits
+    """
+    if window % 2 == 0:
+        raise ValueError("window must be odd")
+    n = len(x)
+    k = window // 2
+    dy = np.full(n, np.nan)
+    # ensure x is numpy array
+    x_arr = x.to_numpy() if hasattr(x, "to_numpy") else np.asarray(x)
+    y_arr = y if isinstance(y, np.ndarray) else np.asarray(y)
+    for i in range(n):
+        lo = max(0, i - k)
+        hi = min(n, i + k + 1)
+        xi = x_arr[lo:hi]
+        yi = y_arr[lo:hi]
+        if xi.size >= 2:
+            # linear fit: slope is derivative
+            p = np.polyfit(xi, yi, 1)
+            dy[i] = p[0]
+    return dy
+
+
 def calculate_perpendicular_profiles(line_coords, num_lines, length_um,
                                      sem_data, current_data,
                                      pixel_size_m=1e-6, detected_junction=None,
@@ -131,25 +173,37 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
         sem_vals = prof["sem"]
         cur_vals = prof["current"]
         sem_vals_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals)+1e-12)
-        # Create a 2-row plot: top = SEM (normalized) + Current (linear) via twin y,
-        # bottom = log10(Current)
-        fig_prof, (ax1, ax_log) = plt.subplots(2, 1, sharex=True, figsize=(6, 5), gridspec_kw={'height_ratios': [1, 1]})
+        # Debug print: basic profile info
+        try:
+            print(f"[perp] profile id={prof.get('id')} n_points={len(dist_um)}")
+        except Exception:
+            print("[perp] profile (id unknown) starting plot")
+        # Create a 3-row plot: top = SEM (normalized) + Current (linear) via twin y,
+        # middle = log10(Current), bottom = derivatives (dI/dx and dlnI/dx)
+        fig_prof, (ax1, ax_log, ax_der) = plt.subplots(3, 1, sharex=True, figsize=(6, 7), gridspec_kw={'height_ratios': [1, 1, 0.8]})
         ax1.plot(dist_um, sem_vals_norm, color='tab:blue', linewidth=2, label='SEM (norm)')
 
         # Plot linear current on a twin axis above (original behavior)
         ax1b = ax1.twinx()
         cur = np.array(cur_vals)
         ax1b.plot(dist_um, cur, color='tab:red', linewidth=1.2, label='Current (nA)')
+        # Debug: current stats
+        try:
+            print(f"[perp] current: min={np.nanmin(cur):.3e} max={np.nanmax(cur):.3e} mean={np.nanmean(cur):.3e}")
+        except Exception:
+            print("[perp] current: could not compute stats")
 
-        # Prepare safe current for plotting and set log y-scale on lower axis
+        # Prepare safe current for plotting and set log y-scale on middle axis
         pos = cur[cur > 0]
         if pos.size > 0:
             floor = max(np.min(pos) * 0.1, 1e-12)
         else:
             floor = 1e-12
         cur_safe = np.maximum(cur, floor)
+        # Debug: floor used for log-safe current
+        print(f"[perp] log-floor used = {floor:.3e} (pos_count={pos.size})")
 
-        # Plot raw current values but use a logarithmic y-axis for the lower subplot
+        # Plot raw current values but use a logarithmic y-axis for the middle subplot
         ax_log.plot(dist_um, cur_safe, color='tab:orange', linewidth=1.5, label='Current (nA)')
         ax_log.set_yscale('log')
 
@@ -159,6 +213,8 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
             ax1.scatter(dist_um[idx], sem_vals_norm[idx], color='lime', s=50, marker='x', zorder=10)
             ax1b.scatter(dist_um[idx], cur[idx], color='lime', s=50, marker='x', zorder=10)
             ax_log.scatter(dist_um[idx], cur_safe[idx], color='lime', s=50, marker='x', zorder=10)
+            # mark on derivative axis at x position (y position will be set by plot)
+            ax_der.scatter(dist_um[idx], 0, color='lime', s=50, marker='x', zorder=10)
 
         # include source name in subplot title for clarity
         if prof.get('source_name'):
@@ -170,13 +226,148 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
         ax1b.set_ylabel("Current (nA)", color='tab:red')
         ax_log.set_xlabel("Distance (µm)")
         ax_log.set_ylabel("Current (nA) [log scale]", color='tab:orange')
-        ax1.set_title(f"Perpendicular {prof['id']+1}")
+        ax_der.set_xlabel("Distance (µm)")
+        ax_der.set_ylabel("Derivatives", color='tab:green')
 
         # Combine legends from ax1 and ax1b
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax1b.get_legend_handles_labels()
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
         ax_log.legend(loc='upper left')
+
+        # Compute measured derivatives (from raw profile)
+        # Using windowed gradient for smoother derivatives
+        x_vals = np.array(dist_um, dtype=float)
+        gradient_window = 9  # window size for gradient computation (must be odd)
+        if x_vals.size > 1:
+            try:
+                dI_dx_meas = gradient_with_window(x_vals, cur, window=gradient_window)
+            except Exception:
+                dI_dx_meas = np.zeros_like(cur)
+            try:
+                dlnI_dx_meas = gradient_with_window(x_vals, np.log(cur_safe), window=gradient_window)
+            except Exception:
+                dlnI_dx_meas = np.zeros_like(cur)
+        else:
+            dI_dx_meas = np.zeros_like(cur)
+            dlnI_dx_meas = np.zeros_like(cur)
+
+        # By default plot the measured derivatives, but if a fit is attached to
+        # this profile and contains precomputed fit derivatives, prefer the
+        # derivative of the interpolated/fitted curve. We will interpolate the
+        # fit-derived derivatives onto the profile x-axis so overlays match.
+        dI_dx_plot = dI_dx_meas
+        dlnI_dx_plot = dlnI_dx_meas
+        fit_dI_dx_interp = None
+        fit_dlnI_dx_interp = None
+
+        # Collect candidate fit dicts from common keys
+        fit_candidates = []
+        # single fit dict
+        if isinstance(prof.get('fit'), dict):
+            fit_candidates.append(prof.get('fit'))
+        # list of fits (fit_sides style)
+        if isinstance(prof.get('fit'), list):
+            fit_candidates.extend(prof.get('fit'))
+        if isinstance(prof.get('fit_sides'), list):
+            fit_candidates.extend(prof.get('fit_sides'))
+        # depletion/best fit containers
+        if isinstance(prof.get('depletion'), dict):
+            best_left = prof['depletion'].get('best_left_fit')
+            best_right = prof['depletion'].get('best_right_fit')
+            if isinstance(best_left, dict):
+                fit_candidates.append(best_left)
+            if isinstance(best_right, dict):
+                fit_candidates.append(best_right)
+
+        # Choose best fit candidate (highest R² if present)
+        best_fit = None
+        if fit_candidates:
+            scored = [(f.get('r2', -np.inf), f) for f in fit_candidates if isinstance(f, dict)]
+            if scored:
+                best_fit = max(scored, key=lambda t: t[0])[1]
+
+        # If we have a best fit, try to obtain fit-derived derivatives
+        if best_fit is not None:
+            try:
+                # prefer precomputed fit derivative arrays if present
+                fit_x = None
+                for k in ('global_x_vals', 'global_x', 'x_vals', 'x'):
+                    if k in best_fit:
+                        fit_x = np.array(best_fit[k], dtype=float)
+                        break
+
+                # pick the fit derivative arrays or compute them from fit_curve
+                # Use windowed gradient for smoother derivatives
+                if 'fit_dI_dx' in best_fit:
+                    fit_dI = np.array(best_fit['fit_dI_dx'], dtype=float)
+                else:
+                    fit_curve_arr = np.array(best_fit.get('fit_curve', []), dtype=float)
+                    if fit_x is not None and fit_x.size > 1:
+                        try:
+                            fit_dI = gradient_with_window(fit_x, fit_curve_arr, window=gradient_window)
+                        except Exception:
+                            fit_dI = None
+                    else:
+                        fit_dI = None
+
+                if 'fit_dlnI_dx' in best_fit:
+                    fit_dln = np.array(best_fit['fit_dlnI_dx'], dtype=float)
+                else:
+                    fit_curve_arr = np.array(best_fit.get('fit_curve', []), dtype=float)
+                    if fit_x is not None and fit_x.size > 1:
+                        try:
+                            fit_dln = gradient_with_window(fit_x, np.log(np.maximum(fit_curve_arr, 1e-12)), window=gradient_window)
+                        except Exception:
+                            fit_dln = None
+                    else:
+                        fit_dln = None
+
+                # Interpolate fit-derived derivatives onto profile x axis if possible
+                if fit_x is not None and fit_x.size > 1 and fit_dI is not None:
+                    # ensure fit_x sorted
+                    sort_idx = np.argsort(fit_x)
+                    fx_sorted = fit_x[sort_idx]
+                    dI_sorted = fit_dI[sort_idx]
+                    fit_dI_dx_interp = np.interp(x_vals, fx_sorted, dI_sorted, left=np.nan, right=np.nan)
+                    dI_dx_plot = fit_dI_dx_interp
+                    fit_dI_dx_interp = fit_dI_dx_interp
+                if fit_x is not None and fit_x.size > 1 and fit_dln is not None:
+                    sort_idx = np.argsort(fit_x)
+                    fx_sorted = fit_x[sort_idx]
+                    dln_sorted = fit_dln[sort_idx]
+                    fit_dlnI_dx_interp = np.interp(x_vals, fx_sorted, dln_sorted, left=np.nan, right=np.nan)
+                    dlnI_dx_plot = fit_dlnI_dx_interp
+            except Exception:
+                # fallback to measured derivatives
+                dI_dx_plot = dI_dx_meas
+                dlnI_dx_plot = dlnI_dx_meas
+
+        # Debug: derivatives stats (min/max and NaN check)
+        try:
+            print(f"[perp] dI/dx (plotted): min={np.nanmin(dI_dx_plot):.3e} max={np.nanmax(dI_dx_plot):.3e} n_nan={np.isnan(dI_dx_plot).sum()}")
+            print(f"[perp] dlnI/dx (plotted): min={np.nanmin(dlnI_dx_plot):.3e} max={np.nanmax(dlnI_dx_plot):.3e} n_nan={np.isnan(dlnI_dx_plot).sum()}")
+        except Exception:
+            print("[perp] derivative stats unavailable")
+
+        # Plot derivatives: prefer fit-derived overlay when available (solid),
+        # and also optionally show measured derivatives as dotted (for comparison)
+        label_dI = 'dI/dx (nA/µm)'
+        label_dln = 'dlnI/dx (1/µm)'
+        if fit_dI_dx_interp is not None:
+            ax_der.plot(dist_um, dI_dx_plot, color='tab:purple', linewidth=1.6, label=label_dI + ' (fit)')
+            # also show measured as dotted for reference
+            ax_der.plot(dist_um, dI_dx_meas, color='tab:purple', linewidth=0.8, linestyle=':', label='dI/dx (meas)')
+        else:
+            ax_der.plot(dist_um, dI_dx_plot, color='tab:purple', linewidth=1.2, label=label_dI)
+
+        if fit_dlnI_dx_interp is not None:
+            ax_der.plot(dist_um, dlnI_dx_plot, color='tab:green', linewidth=1.4, label=label_dln + ' (fit)')
+            ax_der.plot(dist_um, dlnI_dx_meas, color='tab:green', linewidth=0.8, linestyle=':', label='dlnI/dx (meas)')
+        else:
+            ax_der.plot(dist_um, dlnI_dx_plot, color='tab:green', linewidth=1.0, label=label_dln)
+        ax_der.legend(loc='upper left')
+
         fig_prof.tight_layout()
         canvas_plot = FigureCanvasTkAgg(fig_prof, master=scroll_frame)
         try:
@@ -214,11 +405,35 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
             out_path = os.path.join(out_dir, f'{base_name}_perp_{prof["id"]+1:02d}.png')
             fig_prof.savefig(out_path, dpi=200, bbox_inches='tight')
             print(f"Saved perpendicular plot to {out_path}")
-            # Also export numeric profile data as CSV (dist_um, sem, current)
+            # Also export numeric profile data as CSV (dist_um, sem, current, dI_dx, dlnI_dx)
             try:
                 csv_path = os.path.join(out_dir, f'{base_name}_perp_{prof["id"]+1:02d}.csv')
-                data = np.column_stack([dist_um, sem_vals, cur_vals])
-                header = 'dist_um,sem,current'
+                # Ensure derivatives are available for saving
+                x_vals = np.array(dist_um, dtype=float)
+                cur_arr = np.array(cur_vals, dtype=float)
+                if x_vals.size > 1:
+                    dI_dx_save = np.gradient(cur_arr, x_vals)
+                    pos = cur_arr[cur_arr > 0]
+                    if pos.size > 0:
+                        floor_save = max(np.min(pos) * 0.1, 1e-12)
+                    else:
+                        floor_save = 1e-12
+                    cur_safe_save = np.maximum(cur_arr, floor_save)
+                    dlnI_dx_save = np.gradient(np.log(cur_safe_save), x_vals)
+                else:
+                    dI_dx_save = np.zeros_like(cur_arr)
+                    dlnI_dx_save = np.zeros_like(cur_arr)
+
+                # If fit-derived interpolated derivatives are available, include them
+                if fit_dI_dx_interp is not None or fit_dlnI_dx_interp is not None:
+                    # make arrays same length as x_vals (they already are interpolated)
+                    fdI = fit_dI_dx_interp if fit_dI_dx_interp is not None else np.full_like(dI_dx_save, np.nan)
+                    fdln = fit_dlnI_dx_interp if fit_dlnI_dx_interp is not None else np.full_like(dlnI_dx_save, np.nan)
+                    data = np.column_stack([dist_um, sem_vals, cur_vals, dI_dx_save, dlnI_dx_save, fdI, fdln])
+                    header = 'dist_um,sem,current,dI_dx,dlnI_dx,fit_dI_dx,fit_dlnI_dx'
+                else:
+                    data = np.column_stack([dist_um, sem_vals, cur_vals, dI_dx_save, dlnI_dx_save])
+                    header = 'dist_um,sem,current,dI_dx,dlnI_dx'
                 # Use scientific notation with reasonable precision
                 np.savetxt(csv_path, data, delimiter=',', header=header, comments='', fmt='%.6e')
                 print(f"Saved perpendicular CSV to {csv_path}")

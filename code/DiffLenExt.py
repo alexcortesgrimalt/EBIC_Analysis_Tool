@@ -1,7 +1,31 @@
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import os
 import numpy as np  
 from scipy.optimize import curve_fit
+
+
+def _maybe_close(fig):
+    """
+    Close a matplotlib figure only when running in a non-interactive / headless
+    backend (e.g. 'Agg') or when matplotlib is not in interactive mode.
+    This prevents saved figures from being immediately closed when the user
+    runs the GUI interactively and expects windows to remain open.
+    """
+    try:
+        backend = mpl.get_backend().lower()
+        # Only auto-close when backend is clearly headless (Agg).
+        # Do NOT close just because plt.isinteractive() is False — that
+        # causes figures to be closed immediately in scripts where the
+        # user expects interactive windows to remain open.
+        if backend.startswith('agg'):
+            plt.close(fig)
+    except Exception:
+        # If anything goes wrong, attempt a safe close and swallow errors
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
 
 
 class DiffusionLengthExtractor:
@@ -121,6 +145,108 @@ class DiffusionLengthExtractor:
         ss_res = np.sum(residuals ** 2)
         ss_tot = np.sum((y - np.mean(y)) ** 2)
         return 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
+
+    def _detect_plateau_in_derivative(self, x_vals, deriv, min_plateau_length=3, 
+                                      derivative_threshold=0.3, absolute_threshold=0.05,
+                                      search_from_end=False):
+        """
+        Detect plateau regions in the derivative where d(ln(I))/dx is approximately constant.
+        A plateau indicates a linear region in log-space.
+        
+        Parameters
+        ----------
+        x_vals : array
+            Distance values (µm)
+        deriv : array
+            Derivative d(ln(I))/dx
+        min_plateau_length : int
+            Minimum number of points to consider a plateau (default: 5)
+        derivative_threshold : float
+            Maximum allowed relative variation in derivative (as fraction of median, default: 0.3 = 30%)
+        absolute_threshold : float
+            Maximum allowed absolute variation in derivative (1/µm, default: 0.05)
+            This ensures detection works even when derivative is small
+        search_from_end : bool
+            If True, search from the tail inward (away from junction)
+            If False, search from junction outward
+        
+        Returns
+        -------
+        plateau_start : int or None
+            Start index of the detected plateau
+        plateau_end : int or None
+            End index of the detected plateau
+        plateau_mean_deriv : float or None
+            Mean derivative value in the plateau
+        """
+        if len(deriv) < min_plateau_length:
+            return None, None, None
+        
+        # Remove NaN values
+        valid_mask = ~np.isnan(deriv)
+        if np.sum(valid_mask) < min_plateau_length:
+            return None, None, None
+        
+        # Compute BOTH relative and absolute thresholds
+        deriv_abs = np.abs(deriv[valid_mask])
+        median_deriv = np.median(deriv_abs)
+        
+        # Relative threshold (adaptive to signal level)
+        if median_deriv == 0:
+            threshold_relative = 0.1  # fallback
+        else:
+            threshold_relative = derivative_threshold * median_deriv
+        
+        # Use the MORE PERMISSIVE of the two thresholds
+        # This allows detection in both high-derivative and low-derivative regions
+        threshold = max(threshold_relative, absolute_threshold)
+        
+        # Smooth derivative for plateau detection (reduce noise)
+        from scipy.ndimage import uniform_filter1d
+        window = min(5, len(deriv) // 3)
+        if window < 3:
+            window = 3
+        deriv_smooth = uniform_filter1d(deriv.astype(float), size=window, mode='nearest')
+        
+        # Search for plateau
+        n = len(deriv_smooth)
+        best_plateau_start = None
+        best_plateau_end = None
+        best_plateau_length = 0
+        best_plateau_std = np.inf
+        
+        if search_from_end:
+            # Search from tail inward (typical for exponential decay tails)
+            search_range = range(n - min_plateau_length, -1, -1)
+        else:
+            # Search from start outward (from junction)
+            search_range = range(0, n - min_plateau_length + 1)
+        
+        for start in search_range:
+            for length in range(min_plateau_length, min(n - start + 1, 50)):  # max 50 points
+                end = start + length
+                segment = deriv_smooth[start:end]
+                
+                # Check if segment is a plateau (low std deviation)
+                segment_mean = np.mean(segment)
+                segment_std = np.std(segment)
+                segment_range = np.max(segment) - np.min(segment)
+                
+                # Plateau criteria: small std and small range relative to threshold
+                if segment_std < threshold and segment_range < 2 * threshold:
+                    # Prefer longer plateaus with smaller std
+                    if length > best_plateau_length or (length == best_plateau_length and segment_std < best_plateau_std):
+                        best_plateau_start = start
+                        best_plateau_end = end
+                        best_plateau_length = length
+                        best_plateau_std = segment_std
+        
+        if best_plateau_start is not None:
+            plateau_segment = deriv_smooth[best_plateau_start:best_plateau_end]
+            plateau_mean_deriv = np.mean(plateau_segment)
+            return best_plateau_start, best_plateau_end, plateau_mean_deriv
+        
+        return None, None, None
 
     # def fit_profile_sides(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
         #                   plot_left=True, plot_right=True):
@@ -703,7 +829,7 @@ class DiffusionLengthExtractor:
                 plt.show()
             except Exception:
                 pass
-            plt.close(fig)
+            _maybe_close(fig)
             if out_path:
                 if source_name:
                     print(f"Saved depletion plot to {out_path} (source: {source_name})")
@@ -818,8 +944,22 @@ class DiffusionLengthExtractor:
                 ax.grid(True, linestyle='--', alpha=0.5)
                 ax.legend()
             fig_fit.tight_layout()
-            plt.show()
-            plt.close(fig_fit)
+            # Attempt to save the central-fit figure for later inspection
+            try:
+                out_dir = os.path.join(os.getcwd(), 'depletion_plots')
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f'profile_{profile_id:02d}_central_fits.png')
+                fig_fit.savefig(out_path, dpi=200, bbox_inches='tight')
+            except Exception:
+                out_path = None
+
+            try:
+                plt.show()
+            except Exception:
+                pass
+            _maybe_close(fig_fit)
+            if out_path:
+                print(f"Saved central-fit plot to {out_path}")
 
     def visualize_log_profiles(self, base='10', smooth=True, cutoff_fraction=0.05,
                                floor_factor=0.1, subtract_baseline=True):
@@ -968,7 +1108,7 @@ class DiffusionLengthExtractor:
                 plt.show()
             except Exception:
                 pass
-            plt.close(fig)
+            _maybe_close(fig)
             if out_path:
                 print(f"Saved log profile plot to {out_path}")
 
@@ -1018,7 +1158,22 @@ class DiffusionLengthExtractor:
                 ax.legend()
 
             plt.tight_layout()
-            plt.show()
+            # Save the figure showing 1/λ vs shift so users have a persisted copy
+            try:
+                out_dir = os.path.join(os.getcwd(), 'depletion_plots')
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f'profile_{profile_id:02d}_invlambda_vs_shift.png')
+                fig.savefig(out_path, dpi=200, bbox_inches='tight')
+            except Exception:
+                out_path = None
+
+            try:
+                plt.show()
+            except Exception:
+                pass
+            _maybe_close(fig)
+            if out_path:
+                print(f"Saved 1/λ vs shift plot to {out_path}")
 
 
     def compute_average_lengths(self, show_table=True):
@@ -1373,7 +1528,21 @@ class DiffusionLengthExtractor:
         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.grid(True)
         plt.tight_layout()
-        plt.show()
+        # Save tailcut overlay figure to disk
+        try:
+            out_dir = os.path.join(os.getcwd(), 'depletion_plots')
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f'profile_{profile_id:02d}_{side_to_plot}_tailcuts.png')
+            plt.gcf().savefig(out_path, dpi=200, bbox_inches='tight')
+        except Exception:
+            out_path = None
+
+        try:
+            plt.show()
+        except Exception:
+            pass
+        if out_path:
+            print(f"Saved tailcut overlay plot to {out_path}")
 
 
     def fit_profile_sides_iterative(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
@@ -1458,10 +1627,14 @@ class DiffusionLengthExtractor:
             print(f"{side} linear fit failed (shift {shift}) for profile {profile_id}: {e}")
             return None
 
-    def _fit_linear_on_log(self, x, logy, shift, side="Right", profile_id=0, baseline=0.0):
+    def _fit_linear_on_log(self, x, logy, shift, side="Right", profile_id=0, baseline=0.0, x_already_positive=False):
         """
         Fit a linear model to precomputed natural-log values `logy`.
         Returns a dict with fit parameters, R², and fitted curve.
+        
+        Args:
+            x_already_positive: If True, x is already positive distances from edge (for Left side).
+                               If False, will negate x for Left side fitting.
         """
         try:
             # Ensure arrays
@@ -1480,7 +1653,8 @@ class DiffusionLengthExtractor:
 
             # For fitting consistency, flip the x-axis for left-side fits
             # so the polynomial sees increasing distances from the edge.
-            if 'Left' in side:
+            # BUT: if x is already positive (pre-flipped by caller), don't flip again!
+            if 'Left' in side and not x_already_positive:
                 x_for_fit = -np.array(x_arr, dtype=float)
             else:
                 x_for_fit = np.array(x_arr, dtype=float)
@@ -1490,23 +1664,18 @@ class DiffusionLengthExtractor:
             slope = float(p[0])
             intercept = float(p[1])
 
-            # Adjust slope sign so that returned 'slope' corresponds to
-            # the derivative d(ln y)/dx in the profile coordinate system
-            # (x increasing to the right). When we fit the left side we
-            # flipped the x-axis (x_for_fit = -x_arr), so the fitted
-            # slope `slope` is actually d(ln y)/d(-x) = -d(ln y)/dx. To
-            # provide a consistent convention for callers, invert the
-            # sign for left-side fits here.
-            slope_profile = -slope if 'Left' in side else slope
+            # For Left side with pre-flipped positive x, slope is already correct
+            # For Left side with original x (negated for fitting), we need to negate slope
+            if 'Left' in side and not x_already_positive:
+                slope_profile = -slope
+            else:
+                slope_profile = slope
 
-            # Evaluate fitted line in the fit domain (x_for_fit) and map
-            # back to the returned local x ordering (x_arr). For left side
-            # we fitted on -x_arr, so evaluate on -x_for_fit to get values
-            # aligned with x_arr.
-            if 'Left' in side:
+            if 'Left' in side and not x_already_positive:
                 # x_for_fit == -x_arr, so -x_for_fit == x_arr
                 log_fit = np.polyval(p, -x_for_fit)
             else:
+                # For already-positive x (or Right side), evaluate directly
                 log_fit = np.polyval(p, x_for_fit)
 
             # Reconstruct fitted curve in original units by adding the
@@ -1651,11 +1820,15 @@ class DiffusionLengthExtractor:
 
     def fit_profile_sides_linear(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
                                  plot_left=False, plot_right=False, prevent_cross_peak=False,
-                                 use_window_search=True, min_window=20, max_window=80, max_search=20,
+                                 use_window_search=True, min_window=10, max_window=60, max_search=30,
                                  r2_threshold_window=0.75, min_inv_factor=0.2, max_inv_factor=500.0):
         """
         Same flow as fit_profile_sides but fits linear models on ln(current) for
         left and right sides. Uses the same shifting and tail-cut truncation logic.
+        
+        Key change: reduced min_window from 20 to 10, max_window from 80 to 60,
+        and increased max_search from 20 to 30 to better capture short linear
+        regions close to the junction.
         """
         x_vals = np.asarray(x_vals)
         y_vals = np.asarray(y_vals)
@@ -1733,20 +1906,20 @@ class DiffusionLengthExtractor:
         # the detected junction to find small linear regimes close to the
         # intersection. This handles short linear regions that long
         # left-shift fits miss.
-        def _search_local_region(side, length_penalty=0.01):
+        def _search_local_region(side, length_penalty=0.002):
+            """Search for linear-on-log regions by trying different start positions and window sizes.
+            
+            Key improvement: detect the END of linearity by checking if extending the window
+            significantly degrades the fit quality (residuals increase).
+            """
             best_candidate = None
             ref_idx = int(intersection_idx) if intersection_idx is not None else base_idx
             if side == 'Left':
-                # search starts moving left from junction (do not go right
-                # of the peak). Start at the intersection but cap at
-                # base_idx-1 so the left search remains strictly left of
-                # the profile maximum.
+                # Search starting from various positions moving left from junction
                 left_start = min(ref_idx, base_idx - 1)
                 start_range = range(left_start, max(left_start - max_search, 0) - 1, -1)
             else:
-                # search starts moving right from a point *after* the
-                # peak (user-requested): ensure we begin no earlier than
-                # base_idx+1 so right fits are anchored after the maximum.
+                # For right side, start just after the junction/peak
                 right_start = max(ref_idx, base_idx + 1)
                 start_range = range(right_start, min(right_start + max_search, n - 1) + 1)
 
@@ -1765,8 +1938,14 @@ class DiffusionLengthExtractor:
                         max_w = min(max_window, len(y_left_flipped))
                         if max_w < min_window:
                             continue
-                        # try a range of window sizes, prefer smallest window that meets threshold
+                        # Try a range of window sizes - look for the longest window
+                        # that maintains good linearity (high R²)
                         best_local = (None, -np.inf, None, -np.inf)  # (w, r2_lin, fit, score)
+                        prev_r2 = -np.inf
+                        degradation_count = 0
+                        max_degradation = 4  # Stop if R² degrades for this many consecutive steps (more permissive)
+                        degradation_threshold = 0.03  # More permissive threshold for degradation detection
+                        
                         for w in range(min_window, max_w + 1):
                             x_win = x_left_flipped[:w]
                             y_win = y_left_flipped[:w]
@@ -1778,27 +1957,33 @@ class DiffusionLengthExtractor:
                                 baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
                             y_corr = y_arr - baseline
                             pos = y_corr[y_corr > 0]
-                            # Require a reasonable fraction of the window to
-                            # be positive after baseline subtraction to avoid
-                            # floor-induced outliers that dominate the fit.
-                            # Also require the last point to be positive so
-                            # we don't fit across a region that already
-                            # reached the baseline (which produces extreme
-                            # floor values for the log transform).
-                            if pos.size < max(3, int(0.4 * len(y_arr))):
+                            # Require reasonable fraction positive (more permissive)
+                            if pos.size < max(3, int(0.3 * len(y_arr))):
                                 continue
                             floor = max(np.min(pos) * 1e-6, 1e-12)
                             logy = np.log(np.maximum(y_corr, floor))
-                            fit = self._fit_linear_on_log(x=x_win, logy=logy, shift=0, side='Left', profile_id=profile_id, baseline=baseline)
+                            fit = self._fit_linear_on_log(x=x_win, logy=logy, shift=0, side='Left', profile_id=profile_id, baseline=baseline, x_already_positive=True)
                             if fit is None:
                                 continue
-                            # compute linear-domain R² on y vs fit_curve_local
+                            # Compute linear-domain R² on y vs fit_curve_local
                             try:
                                 y_true = np.exp(logy) + baseline
                                 y_fit = np.array(fit.get('fit_curve_local', []), dtype=float)
                                 r2_lin = self._calculate_r2(y_true, y_fit)
                             except Exception:
                                 r2_lin = -np.inf
+                            
+                            # Check if R² is degrading - this indicates we've left the linear region
+                            if r2_lin < prev_r2 - degradation_threshold:
+                                degradation_count += 1
+                                if degradation_count >= max_degradation:
+                                    # Stop here - we've likely left the linear region
+                                    break
+                            else:
+                                degradation_count = 0
+                                prev_r2 = r2_lin
+                            
+                            # Score: favor high R² with very small penalty for window length
                             score = (r2_lin - length_penalty * float(w))
                             # Reject fits that imply an unphysically small
                             # characteristic length (inv_lambda) which often
@@ -1847,6 +2032,10 @@ class DiffusionLengthExtractor:
                         if max_w < min_window:
                             continue
                         best_local = (None, -np.inf, None, -np.inf)
+                        prev_r2 = -np.inf
+                        degradation_count = 0
+                        max_degradation = 4  # More permissive
+                        degradation_threshold = 0.03  # More permissive threshold
                         try:
                             start_pos_right = float(right_x_raw[0])
                             x_right_local = (np.array(right_x_raw, dtype=float) - start_pos_right)
@@ -1863,7 +2052,8 @@ class DiffusionLengthExtractor:
                                 baseline = float(max(np.median(y_arr[-tail_n:]), 0.0))
                             y_corr = y_arr - baseline
                             pos = y_corr[y_corr > 0]
-                            if pos.size < max(3, int(0.6 * len(y_arr))) or y_corr[-1] <= 0:
+                            # More permissive: require only 40% positive
+                            if pos.size < max(3, int(0.4 * len(y_arr))) or y_corr[-1] <= 0:
                                 continue
                             floor = max(np.min(pos) * 1e-6, 1e-12)
                             logy = np.log(np.maximum(y_corr, floor))
@@ -1876,6 +2066,17 @@ class DiffusionLengthExtractor:
                                 r2_lin = self._calculate_r2(y_true, y_fit)
                             except Exception:
                                 r2_lin = -np.inf
+                            
+                            # Check if R² is degrading - indicates end of linear region
+                            if r2_lin < prev_r2 - degradation_threshold:
+                                degradation_count += 1
+                                if degradation_count >= max_degradation:
+                                    break
+                            else:
+                                degradation_count = 0
+                                prev_r2 = r2_lin
+                            
+                            # Score: favor high R² with small penalty for window length
                             score = (r2_lin - length_penalty * float(w))
                             try:
                                 pixel_size_um = self.pixel_size * 1e6
@@ -2021,6 +2222,22 @@ class DiffusionLengthExtractor:
             # If window search produced at least one windowed fit, prefer
             # those and return early to avoid appending older long-tail fits.
             if left_win is not None or right_win is not None:
+                # Debug output to show what was fitted
+                ref_pos = float(x_vals[intersection_idx]) if intersection_idx is not None else float(x_vals[base_idx])
+                if left_win is not None:
+                    s_l, w_l = (left_win[0], left_win[1]) if len(left_win) >= 2 else (None, None)
+                    r2_l = left_win[3] if len(left_win) >= 4 else None
+                    if s_l is not None:
+                        start_pos = float(x_vals[s_l])
+                        end_pos = float(x_vals[max(0, s_l - w_l)])
+                        print(f"Profile {profile_id} Left: window={w_l}pts, R²={r2_l:.3f}, range=[{end_pos:.2f}, {start_pos:.2f}]µm (junction at {ref_pos:.2f}µm)")
+                if right_win is not None:
+                    s_r, w_r = (right_win[0], right_win[1]) if len(right_win) >= 2 else (None, None)
+                    r2_r = right_win[3] if len(right_win) >= 4 else None
+                    if s_r is not None:
+                        start_pos = float(x_vals[s_r])
+                        end_pos = float(x_vals[min(len(x_vals)-1, s_r + w_r)])
+                        print(f"Profile {profile_id} Right: window={w_r}pts, R²={r2_r:.3f}, range=[{start_pos:.2f}, {end_pos:.2f}]µm (junction at {ref_pos:.2f}µm)")
                 return results
 
         # --- RIGHT side: find start index ---
@@ -2259,6 +2476,244 @@ class DiffusionLengthExtractor:
 
         return results
 
+    def fit_profile_sides_plateau_based(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
+                                        gradient_window=9, min_plateau_length=5, 
+                                        derivative_threshold=0.2, absolute_threshold=0.05):
+        """
+        NEW METHOD: Fit linear regions using derivative plateau detection.
+        
+        This method:
+        1. Computes d(ln(I))/dx using windowed gradient
+        2. Detects plateaus in the derivative (constant deriv = linear region in log)
+        3. Fits straight lines to ln(I) within the detected plateau regions
+        4. Extracts depletion width from the gap between left and right plateaus
+        
+        Parameters
+        ----------
+        gradient_window : int
+            Window size for gradient computation (must be odd)
+        min_plateau_length : int
+            Minimum number of points to consider a plateau
+        derivative_threshold : float
+            Maximum relative variation in derivative (as fraction of median) for plateau detection
+        absolute_threshold : float
+            Maximum absolute variation in derivative (1/µm) for plateau detection
+            Ensures robust detection even when derivative is small
+        
+        Returns
+        -------
+        results : list
+            List with best_left and best_right fit dicts
+        """
+        from .perpendicular import gradient_with_window
+        
+        x_vals = np.asarray(x_vals, dtype=float)
+        y_vals = np.asarray(y_vals, dtype=float)
+        
+        base_idx = int(np.argmax(y_vals))
+        if intersection_idx is None:
+            intersection_idx = base_idx
+        
+        results = []
+        
+        # Prepare log-transformed data (NO FILTERING for plateau detection)
+        # Use raw data directly to preserve true signal characteristics
+        pos = y_vals[y_vals > 0]
+        floor = max(np.min(pos) * 0.1, 1e-12) if pos.size > 0 else 1e-12
+        y_safe = np.maximum(y_vals, floor)
+        ln_y = np.log(y_safe)
+        
+        # Compute derivative d(ln(I))/dx using windowed gradient
+        try:
+            dlnI_dx = gradient_with_window(x_vals, ln_y, window=gradient_window)
+        except Exception as e:
+            print(f"Profile {profile_id}: Failed to compute gradient: {e}")
+            return results
+        
+        # --- LEFT SIDE: Detect plateau from junction moving leftward ---
+        left_x = x_vals[:intersection_idx + 1]
+        left_ln_y = ln_y[:intersection_idx + 1]
+        left_deriv = dlnI_dx[:intersection_idx + 1]
+        
+        # Flip to search from tail inward
+        left_x_flip = left_x[::-1]
+        left_ln_y_flip = left_ln_y[::-1]
+        left_deriv_flip = left_deriv[::-1]
+        
+        plat_start_l, plat_end_l, mean_deriv_l = self._detect_plateau_in_derivative(
+            left_x_flip, left_deriv_flip, 
+            min_plateau_length=min_plateau_length,
+            derivative_threshold=derivative_threshold,
+            absolute_threshold=absolute_threshold,
+            search_from_end=False  # search from tail inward
+        )
+        
+        if plat_start_l is not None and plat_end_l is not None:
+            # Extract plateau region
+            x_plateau_l = left_x_flip[plat_start_l:plat_end_l]
+            ln_y_plateau_l = left_ln_y_flip[plat_start_l:plat_end_l]
+            y_plateau_l = np.exp(ln_y_plateau_l)
+            
+            # Validate: Check that plateau is not in the noise floor
+            peak_signal = np.max(y_vals)
+            plateau_mean_signal = np.mean(y_plateau_l)
+            signal_ratio = plateau_mean_signal / peak_signal
+            
+            # Reject if plateau is too weak (< 10% of peak signal = likely noise floor)
+            if signal_ratio < 0.10:
+                print(f"Profile {profile_id} Left: Rejected plateau at noise floor (signal={signal_ratio:.1%} of peak)")
+                plat_start_l, plat_end_l = None, None
+            
+            # Fit straight line to ln(I) in the plateau
+            if plat_start_l is not None and len(x_plateau_l) >= 2:
+                p = np.polyfit(x_plateau_l, ln_y_plateau_l, 1)
+                slope_log = float(p[0])
+                intercept_log = float(p[1])
+                
+                # Compute fit curve in log-space and linear space
+                ln_fit = np.polyval(p, x_plateau_l)
+                fit_curve_local = np.exp(ln_fit)
+                
+                # Compute R²
+                r2 = self._calculate_r2(ln_y_plateau_l, ln_fit)
+                
+                # Characteristic length
+                inv_lambda_um = np.inf if slope_log == 0 else 1.0 / abs(slope_log)
+                pixel_size_um = self.pixel_size * 1e6
+                if np.isfinite(inv_lambda_um) and pixel_size_um > 0:
+                    inv_lambda = max(round(inv_lambda_um / pixel_size_um) * pixel_size_um, pixel_size_um)
+                else:
+                    inv_lambda = inv_lambda_um
+                
+                # Map back to original profile coordinates (un-flip)
+                # Original indices: [0, 1, ..., intersection_idx]
+                # Flipped indices: [intersection_idx, ..., 1, 0]
+                # Plateau in flipped: [plat_start_l:plat_end_l]
+                # Map back: intersection_idx - plat_end_l + 1, intersection_idx - plat_start_l + 1
+                orig_start = intersection_idx - plat_end_l + 1
+                orig_end = intersection_idx - plat_start_l + 1
+                global_x_vals = x_vals[orig_start:orig_end]
+                
+                # Evaluate the fit at the GLOBAL x coordinates for proper plotting
+                # The fit was done on flipped x (x_plateau_l), but we need to evaluate
+                # it at the original x coordinates (global_x_vals) for plotting
+                ln_fit_global = np.polyval(p, global_x_vals[::-1])[::-1]  # Flip to match, then flip back
+                fit_curve_global = np.exp(ln_fit_global)
+                
+                results.append({
+                    'side': 'Left (plateau)',
+                    'shift': 0,
+                    'x_vals': x_plateau_l,
+                    'y_vals': y_plateau_l,
+                    'fit_curve': fit_curve_global,  # Use global-coordinate fit for plotting
+                    'fit_curve_local': fit_curve_local,
+                    'ln_fit_curve': ln_fit_global,  # Store log-space fit at global coords for plotting
+                    'global_x_vals': global_x_vals,
+                    'parameters': (slope_log, intercept_log),
+                    'slope': slope_log,
+                    'intercept': intercept_log,
+                    'inv_lambda': inv_lambda,
+                    'r2': r2,
+                    'plateau_indices': (orig_start, orig_end)
+                })
+                print(f"Profile {profile_id} Left: Detected plateau from index {orig_start} to {orig_end}, "
+                      f"slope={slope_log:.3g}, R²={r2:.3f}, inv_lambda={inv_lambda:.3g} µm")
+        else:
+            print(f"Profile {profile_id}: No left plateau detected")
+        
+        # --- RIGHT SIDE: Detect plateau from junction moving rightward ---
+        right_x = x_vals[intersection_idx:]
+        right_ln_y = ln_y[intersection_idx:]
+        right_deriv = dlnI_dx[intersection_idx:]
+        
+        # Limit search to avoid far tail noise floor (use first 70% of data)
+        search_limit = max(min_plateau_length + 5, int(len(right_x) * 0.7))
+        right_x_limited = right_x[:search_limit]
+        right_ln_y_limited = right_ln_y[:search_limit]
+        right_deriv_limited = right_deriv[:search_limit]
+        
+        plat_start_r, plat_end_r, mean_deriv_r = self._detect_plateau_in_derivative(
+            right_x_limited, right_deriv_limited,
+            min_plateau_length=min_plateau_length,
+            derivative_threshold=derivative_threshold,
+            absolute_threshold=absolute_threshold,
+            search_from_end=False  # search from junction outward to avoid tail noise
+        )
+        
+        if plat_start_r is not None and plat_end_r is not None:
+            # Extract plateau region
+            x_plateau_r = right_x[plat_start_r:plat_end_r]
+            ln_y_plateau_r = right_ln_y[plat_start_r:plat_end_r]
+            y_plateau_r = np.exp(ln_y_plateau_r)
+            
+            # Validate: Check that plateau is not in the noise floor
+            # Compare plateau signal level to peak signal
+            peak_signal = np.max(y_vals)
+            plateau_mean_signal = np.mean(y_plateau_r)
+            signal_ratio = plateau_mean_signal / peak_signal
+            
+            # Reject if plateau is too weak (< 10% of peak signal = likely noise floor)
+            if signal_ratio < 0.10:
+                print(f"Profile {profile_id} Right: Rejected plateau at noise floor (signal={signal_ratio:.1%} of peak)")
+                plat_start_r, plat_end_r = None, None
+            
+            # Fit straight line to ln(I) in the plateau
+            if plat_start_r is not None and len(x_plateau_r) >= 2:
+                # Transform to local coordinates (starting from 0)
+                x_local_r = x_plateau_r - x_plateau_r[0]
+                p = np.polyfit(x_local_r, ln_y_plateau_r, 1)
+                slope_log = float(p[0])
+                intercept_log = float(p[1])
+                
+                # Compute fit curve in log-space and linear space
+                ln_fit = np.polyval(p, x_local_r)
+                fit_curve_local = np.exp(ln_fit)
+                
+                # Compute R²
+                r2 = self._calculate_r2(ln_y_plateau_r, ln_fit)
+                
+                # Characteristic length
+                inv_lambda_um = np.inf if slope_log == 0 else 1.0 / abs(slope_log)
+                pixel_size_um = self.pixel_size * 1e6
+                if np.isfinite(inv_lambda_um) and pixel_size_um > 0:
+                    inv_lambda = max(round(inv_lambda_um / pixel_size_um) * pixel_size_um, pixel_size_um)
+                else:
+                    inv_lambda = inv_lambda_um
+                
+                # Map to original profile coordinates
+                orig_start = intersection_idx + plat_start_r
+                orig_end = intersection_idx + plat_end_r
+                global_x_vals = x_vals[orig_start:orig_end]
+                
+                # Evaluate the fit at the GLOBAL x coordinates for proper plotting
+                # Convert global x to local coordinates relative to plateau start
+                x_local_global = global_x_vals - global_x_vals[0]
+                ln_fit_global = np.polyval(p, x_local_global)
+                fit_curve_global = np.exp(ln_fit_global)
+                
+                results.append({
+                    'side': 'Right (plateau)',
+                    'shift': 0,
+                    'x_vals': x_local_r,
+                    'y_vals': y_plateau_r,
+                    'fit_curve': fit_curve_global,  # Use global-coordinate fit for plotting
+                    'fit_curve_local': fit_curve_local,
+                    'ln_fit_curve': ln_fit_global,  # Store log-space fit at global coords for plotting
+                    'global_x_vals': global_x_vals,
+                    'parameters': (slope_log, intercept_log),
+                    'slope': slope_log,
+                    'intercept': intercept_log,
+                    'inv_lambda': inv_lambda,
+                    'r2': r2,
+                    'plateau_indices': (orig_start, orig_end)
+                })
+                print(f"Profile {profile_id} Right: Detected plateau from index {orig_start} to {orig_end}, "
+                      f"slope={slope_log:.3g}, R²={r2:.3f}, inv_lambda={inv_lambda:.3g} µm")
+        else:
+            print(f"Profile {profile_id}: No right plateau detected")
+        
+        return results
+
     def fit_profile_sides_iterative_linear(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
                                            plot_left=False, plot_right=False, max_iter=10, tol_factor=1.0):
         """
@@ -2306,10 +2761,16 @@ class DiffusionLengthExtractor:
 
         return results
 
-    def fit_all_profiles_linear(self):
+    def fit_all_profiles_linear(self, use_plateau_detection=True):
         """
         Run linear-on-log fitting for all loaded profiles and populate self.results
         similarly to fit_all_profiles.
+        
+        Parameters
+        ----------
+        use_plateau_detection : bool
+            If True, use derivative plateau detection (NEW METHOD - recommended)
+            If False, use the old iterative window search method
         """
         self.results = []
         self.inv_lambdas = []
@@ -2320,11 +2781,24 @@ class DiffusionLengthExtractor:
             x_vals = np.array(prof['dist_um'])
             y_vals = np.array(prof['current'])
 
-            sides = self.fit_profile_sides_iterative_linear(
-                x_vals, y_vals,
-                intersection_idx=intersection_idx,
-                profile_id=i + 1
-            )
+            if use_plateau_detection:
+                # NEW: Use derivative plateau detection
+                sides = self.fit_profile_sides_plateau_based(
+                    x_vals, y_vals,
+                    intersection_idx=intersection_idx,
+                    profile_id=i + 1,
+                    gradient_window=9,
+                    min_plateau_length=5,
+                    derivative_threshold=0.2,
+                    absolute_threshold=0.05  # 0.05 1/µm absolute tolerance
+                )
+            else:
+                # OLD: Use iterative window search
+                sides = self.fit_profile_sides_iterative_linear(
+                    x_vals, y_vals,
+                    intersection_idx=intersection_idx,
+                    profile_id=i + 1
+                )
 
             depletion_info = self._extract_depletion_region(
                 sides, x_vals, np.argmax(y_vals)

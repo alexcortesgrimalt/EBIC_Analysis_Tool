@@ -37,6 +37,19 @@ from .helper_gui import fit_perpendicular_profiles, fit_perpendicular_profiles_l
 from .helper_gui import ask_junction_width, ask_junction_weight, draw_scalebar, safe_remove_colorbar
 from .ROI_extractor import extract_line_rectangle
 
+# Helper: close figures only in non-interactive/headless contexts
+def _maybe_close(fig):
+    try:
+        backend = matplotlib.get_backend().lower()
+        # Only auto-close when backend is clearly headless (Agg).
+        if backend.startswith('agg'):
+            plt.close(fig)
+    except Exception:
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+
 # ==================== SEM VIEWER ====================
 class SEMViewer:
     def __init__(self, pixel_maps, current_maps, pixel_size, sample_name, frame_sizes=None, dpi=100, sweep_datasets=None, sweep_start_index=0):
@@ -771,7 +784,7 @@ class SEMViewer:
 
         if data is None:
             print("No data to save for the current frame.")
-            plt.close(fig)
+            _maybe_close(fig)
             return
 
         cmap = 'gray' if self.map_type == 'pixel' else self.current_colormaps[self.current_cmap_index]
@@ -783,7 +796,7 @@ class SEMViewer:
         ax.set_yticks([])
         fig.tight_layout()
         fig.savefig(img_save_path)
-        plt.close(fig)
+        _maybe_close(fig)
         print(f"Saved overlay image to {img_save_path}")
 
     def _on_scroll(self, event):
@@ -1220,24 +1233,61 @@ class SEMViewer:
 
                 sem_vals_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals) + 1e-12)
 
-                fig, ax1 = plt.subplots(figsize=(6, 3))
+                # Create a 3-row stacked figure: SEM+current, log-current, derivative
+                fig, (ax1, ax_log, ax_deriv) = plt.subplots(
+                    3, 1, sharex=True, figsize=(6, 7), gridspec_kw={'height_ratios': [1, 1, 0.8]}
+                )
+
                 ax1.plot(dist_um, sem_vals_norm, color='tab:blue', linewidth=2, label='SEM (norm)')
                 ax2 = ax1.twinx()
                 ax2.plot(dist_um, cur_vals, color='tab:red', linewidth=1.5, label='Current (nA)')
 
-                # Mark intersection point
+                # Mark intersection point on axes
                 if prof.get("intersection_idx") is not None:
                     idx = prof["intersection_idx"]
-                    ax1.scatter(dist_um[idx], sem_vals_norm[idx], color='lime', s=50, marker='x', zorder=10)
-                    ax2.scatter(dist_um[idx], cur_vals[idx], color='lime', s=50, marker='x', zorder=10)
+                    try:
+                        ax1.scatter(dist_um[idx], sem_vals_norm[idx], color='lime', s=50, marker='x', zorder=10)
+                        ax2.scatter(dist_um[idx], cur_vals[idx], color='lime', s=50, marker='x', zorder=10)
+                    except Exception:
+                        pass
 
                 ax1.set_xlabel("Distance (µm)")
                 ax1.set_ylabel("SEM Contrast (norm)", color='tab:blue')
                 ax2.set_ylabel("Current (nA)", color='tab:red')
                 ax1.set_title(f"Perpendicular {prof['id'] + 1}")
                 ax1.legend(loc='upper left')
+
+                # Middle: log-scale current
+                cur = np.array(cur_vals)
+                pos = cur[cur > 0]
+                if pos.size > 0:
+                    floor = max(np.min(pos) * 0.1, 1e-12)
+                else:
+                    floor = 1e-12
+                cur_safe = np.maximum(cur, floor)
+                ax_log.plot(dist_um, cur_safe, color='tab:orange', linewidth=1.5, label='Current (nA)')
+                ax_log.set_yscale('log')
+
+                # Bottom: numeric derivative dI/dx
+                try:
+                    deriv = np.gradient(cur, dist_um)
+                    ax_deriv.plot(dist_um, deriv, color='tab:green', linewidth=1.2, label='dI/dx')
+                    ax_deriv.fill_between(dist_um, deriv, 0, where=(deriv >= 0), interpolate=True, color='tab:green', alpha=0.25)
+                    ax_deriv.fill_between(dist_um, deriv, 0, where=(deriv < 0), interpolate=True, color='tab:red', alpha=0.12)
+                    if prof.get("intersection_idx") is not None:
+                        try:
+                            ax_deriv.scatter(dist_um[idx], deriv[idx], color='lime', s=40, marker='x', zorder=10)
+                        except Exception:
+                            pass
+                    ax_deriv.set_ylabel('dI/dx (nA/µm)')
+                    ax_deriv.grid(True, linestyle='--', alpha=0.3)
+                    ax_deriv.legend(loc='upper left')
+                except Exception:
+                    ax_deriv.text(0.5, 0.5, 'dI/dx unavailable', ha='center', va='center')
+
                 fig.tight_layout()
 
+                from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
                 plot_canvas = FigureCanvasTkAgg(fig, master=scroll_frame)
                 widget = plot_canvas.get_tk_widget()
                 widget.pack(pady=10)
