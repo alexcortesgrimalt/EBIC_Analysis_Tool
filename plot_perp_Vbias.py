@@ -6,6 +6,10 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import datetime
+
+# Subfolder name for adapted results. Can be overridden by env var
+DEFAULT_OUTPUT_SUBDIR = os.environ.get('PERP_OUTPUT_SUBDIR', 'adapted_results')
 #!/usr/bin/env python3
 
 
@@ -159,6 +163,13 @@ def _bias_sort_key(bias_str):
 
 
 def plot_sample(sample, bias_aggregates, out_dir, show=False, suffix=''):
+    # Create a sample-specific output directory under out_dir
+    try:
+        sample_out = os.path.join(out_dir, str(sample))
+        os.makedirs(sample_out, exist_ok=True)
+    except Exception:
+        sample_out = out_dir
+
     # Linear current plot
     plt.figure(figsize=(7, 5))
     cmap = plt.get_cmap('tab10')
@@ -187,7 +198,7 @@ def plot_sample(sample, bias_aggregates, out_dir, show=False, suffix=''):
     plt.grid(True, linestyle=':', alpha=0.6)
     plt.tight_layout()
     name_base = f"{sample}{suffix}_perp_current_vs_distance.png"
-    out_path = os.path.join(out_dir, name_base)
+    out_path = os.path.join(sample_out, name_base)
     plt.savefig(out_path, dpi=200)
     if show:
         plt.show()
@@ -240,18 +251,62 @@ def plot_sample(sample, bias_aggregates, out_dir, show=False, suffix=''):
     plt.legend()
     plt.grid(True, linestyle=':', alpha=0.6)
     plt.tight_layout()
-    out_path_log = os.path.join(out_dir, f"{sample}{suffix}_perp_ln_current_vs_distance.png")
+    out_path_log = os.path.join(sample_out, f"{sample}{suffix}_perp_ln_current_vs_distance.png")
     plt.savefig(out_path_log, dpi=200)
     if show:
         plt.show()
     plt.close()
     print(f"Saved: {out_path_log}")
 
+    # Compute physical properties (depletion width) per bias using the aggregated curve
+    phys_rows = []
+    try:
+        from code.DiffLenExt import DiffusionLengthExtractor
+        de = DiffusionLengthExtractor()
+        for bias_str, agg_df in sorted(bias_aggregates.items(), key=lambda x: _bias_sort_key(x[0])):
+            if agg_df.empty:
+                continue
+            x = agg_df['distance'].values
+            y = agg_df['current_mean'].values
+            # choose intersection index as peak of aggregated mean
+            base_idx = int(np.nanargmax(y)) if y.size > 0 else None
+            try:
+                sides = de.fit_profile_sides_plateau_based(x, y, intersection_idx=base_idx, profile_id=0)
+                depletion_info = de._extract_depletion_region(sides, x, base_idx if base_idx is not None else 0)
+                depletion_width = depletion_info.get('depletion_width', None)
+                left_start = depletion_info.get('left_start', None)
+                right_start = depletion_info.get('right_start', None)
+            except Exception:
+                depletion_width = None
+                left_start = None
+                right_start = None
+
+            # Only record physical properties for this bias if depletion extraction succeeded
+            if depletion_width is not None:
+                phys_rows.append({'bias': bias_str, 'bias_volt': bias_to_volt(bias_str), 'depletion_width': depletion_width, 'left_start': left_start, 'right_start': right_start, 'n': int(agg_df['n'].max())})
+
+        # Save per-sample physical properties CSV
+        if phys_rows:
+            phys_path = os.path.join(sample_out, 'physical_properties.csv')
+            import csv
+            try:
+                with open(phys_path, 'w', newline='') as cf:
+                    writer = csv.writer(cf)
+                    writer.writerow(['bias_token', 'bias_volt', 'depletion_width', 'left_start', 'right_start', 'n_repeats'])
+                    for r in phys_rows:
+                        writer.writerow([r.get('bias'), r.get('bias_volt'), r.get('depletion_width'), r.get('left_start'), r.get('right_start'), r.get('n')])
+                print(f"Saved physical properties to {phys_path}")
+            except Exception as e:
+                print(f"Failed to save physical properties CSV for {sample}: {e}")
+    except Exception:
+        # If DiffusionLengthExtractor import or processing fails, skip
+        pass
+
 
 def main(directory='.', pattern='*_perp_*.csv', out_dir=None, show=False):
     # Default output directory: create a dedicated folder 'output_perp_vbias'
     if out_dir is None:
-        out_dir = os.path.join(directory, 'output_perp_vbias')
+        out_dir = os.path.join(directory, 'output_perp_vbias', DEFAULT_OUTPUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
 
     files = glob.glob(os.path.join(directory, pattern))
@@ -260,6 +315,8 @@ def main(directory='.', pattern='*_perp_*.csv', out_dir=None, show=False):
         return
 
     data_map = defaultdict(lambda: defaultdict(list))
+    # Optionally collect per-file linear-extraction results
+    extraction_rows = []
     for f in files:
         meta = parse_filename(f)
         if not meta:
@@ -286,6 +343,53 @@ def main(directory='.', pattern='*_perp_*.csv', out_dir=None, show=False):
         except Exception as e:
             print(f"Skipping {csv_path}: {e}")
             continue
+        # If user requested linear extraction in sweep mode, run the linear
+        # fitting on each file individually and store results for output.
+        # We import the extractor here to avoid adding a hard dependency at
+        # module-import time for scripts that don't use extraction.
+        try:
+            if os.environ.get('EXTRACT_LINEAR_IN_SWEEP', '0') == '1':
+                from code.DiffLenExt import DiffusionLengthExtractor
+                de = DiffusionLengthExtractor()
+                x = df['distance'].values
+                y = df['current'].values
+                # use intersection at peak by default
+                inter = int(np.argmax(y)) if y.size > 0 else None
+                sides = de.fit_profile_sides_plateau_based(x, y, intersection_idx=inter, profile_id=0)
+                # Collect per-side candidate rows
+                for s in sides:
+                    slope = s.get('slope')
+                    inv_lambda = s.get('inv_lambda')
+                    r2 = s.get('r2')
+                    side_name = s.get('side')
+                    # try to get global x span
+                    gx = s.get('global_x_vals', None)
+                    if gx is not None and len(gx) > 0:
+                        span = (float(gx[0]), float(gx[-1]))
+                    else:
+                        span = (None, None)
+                    extraction_rows.append({'file': csv_path, 'sample': sample, 'bias': bias,
+                                             'side': side_name, 'slope': slope, 'inv_lambda': inv_lambda,
+                                             'r2': r2, 'span_start': span[0], 'span_end': span[1]})
+                # Also compute a per-file depletion width (if both sides present)
+                try:
+                    depletion_info = de._extract_depletion_region(sides, x, inter if inter is not None else 0)
+                    depletion_width = depletion_info.get('depletion_width', None)
+                    left_start = depletion_info.get('left_start', None)
+                    right_start = depletion_info.get('right_start', None)
+                except Exception:
+                    depletion_width = None
+                    left_start = None
+                    right_start = None
+                # Append a per-file summary row only if depletion extraction succeeded
+                if depletion_width is not None:
+                    extraction_rows.append({'file': csv_path, 'sample': sample, 'bias': bias,
+                                             'side': 'depletion_summary', 'slope': None, 'inv_lambda': None,
+                                             'r2': None, 'span_start': left_start, 'span_end': right_start,
+                                             'depletion_width': depletion_width})
+        except Exception:
+            # don't fail the sweep for extraction errors; report and continue
+            pass
         data_map[sample][bias].append(df)
 
     # No interactive prompt: produce two sets of plots per sample
@@ -316,7 +420,74 @@ def main(directory='.', pattern='*_perp_*.csv', out_dir=None, show=False):
             if set(no_neg_aggregates.keys()) != set(full_aggregates.keys()):
                 plot_sample(sample, no_neg_aggregates, out_dir, show=show, suffix='_without_neg')
 
+    
+    # If we collected per-file extraction rows, save them as CSV
+    if extraction_rows:
+        import csv
+        extract_path = os.path.join(out_dir, 'sweep_linear_extraction.csv')
+        try:
+            with open(extract_path, 'w', newline='') as cf:
+                writer = csv.writer(cf)
+                writer.writerow(['file', 'sample', 'bias', 'side', 'slope', 'inv_lambda', 'r2', 'span_start', 'span_end', 'depletion_width'])
+                for r in extraction_rows:
+                    writer.writerow([r.get('file'), r.get('sample'), r.get('bias'), r.get('side'), r.get('slope'), r.get('inv_lambda'), r.get('r2'), r.get('span_start'), r.get('span_end'), r.get('depletion_width')])
+            print(f"Saved sweep linear extraction results to {extract_path}")
+        except Exception as e:
+            print(f"Failed to save sweep linear extraction CSV: {e}")
+        # Compute grouped statistics from per-file depletion summaries so
+        # users can plot mean ± std later. We aggregate depletion_width,
+        # left_start and right_start by sample & bias.
+        try:
+            import numpy as _np
+            stats_map = defaultdict(lambda: {'depletion': [], 'left': [], 'right': []})
+            for r in extraction_rows:
+                # only consider rows that carry depletion summary
+                if r.get('side') != 'depletion_summary':
+                    continue
+                samp = r.get('sample')
+                bias = r.get('bias')
+                key = (samp, bias)
+                dw = r.get('depletion_width', None)
+                ls = r.get('span_start', None)
+                rs = r.get('span_end', None)
+                if dw is not None:
+                    stats_map[key]['depletion'].append(float(dw))
+                if ls is not None:
+                    stats_map[key]['left'].append(float(ls))
+                if rs is not None:
+                    stats_map[key]['right'].append(float(rs))
 
+            stats_rows = []
+            for (samp, bias), vals in stats_map.items():
+                arr_dw = _np.array(vals['depletion'], dtype=float) if vals['depletion'] else _np.array([], dtype=float)
+                arr_ls = _np.array(vals['left'], dtype=float) if vals['left'] else _np.array([], dtype=float)
+                arr_rs = _np.array(vals['right'], dtype=float) if vals['right'] else _np.array([], dtype=float)
+                n = int(max(len(arr_dw), 0))
+                mean_dw = float(_np.nan) if arr_dw.size == 0 else float(_np.nanmean(arr_dw))
+                std_dw = float(_np.nan) if arr_dw.size == 0 else float(_np.nanstd(arr_dw, ddof=0))
+                mean_ls = float(_np.nan) if arr_ls.size == 0 else float(_np.nanmean(arr_ls))
+                std_ls = float(_np.nan) if arr_ls.size == 0 else float(_np.nanstd(arr_ls, ddof=0))
+                mean_rs = float(_np.nan) if arr_rs.size == 0 else float(_np.nanmean(arr_rs))
+                std_rs = float(_np.nan) if arr_rs.size == 0 else float(_np.nanstd(arr_rs, ddof=0))
+                stats_rows.append({'sample': samp, 'bias': bias, 'bias_volt': bias_to_volt(bias), 'n_files': n,
+                                   'mean_depletion_width': mean_dw, 'std_depletion_width': std_dw,
+                                   'mean_left_start': mean_ls, 'std_left_start': std_ls,
+                                   'mean_right_start': mean_rs, 'std_right_start': std_rs})
+
+            # Save combined stats CSV in top-level output directory
+            if stats_rows:
+                stats_path = os.path.join(out_dir, 'physical_properties_stats.csv')
+                try:
+                    with open(stats_path, 'w', newline='') as sf:
+                        w = csv.writer(sf)
+                        w.writerow(['sample', 'bias_token', 'bias_volt', 'n_files', 'mean_depletion_width', 'std_depletion_width', 'mean_left_start', 'std_left_start', 'mean_right_start', 'std_right_start'])
+                        for r in stats_rows:
+                            w.writerow([r['sample'], r['bias'], r['bias_volt'], r['n_files'], r['mean_depletion_width'], r['std_depletion_width'], r['mean_left_start'], r['std_left_start'], r['mean_right_start'], r['std_right_start']])
+                    print(f"Saved physical properties statistics to {stats_path}")
+                except Exception as e:
+                    print(f"Failed to save physical properties stats CSV: {e}")
+        except Exception as e:
+            print(f"Failed to compute/write statistics: {e}")
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description="Plot perpendicular current vs distance for multiple biases and samples.")
     p.add_argument('directory', nargs='?', default='.', help='Directory to scan for CSV files')
@@ -324,6 +495,7 @@ if __name__ == '__main__':
     p.add_argument('--out', default=None, help='Output directory for PNGs (default: same as input directory)')
     p.add_argument('--show', action='store_true', help='Show plots interactively')
     p.add_argument('--include-negative', action='store_true', help='Include negative biases without prompting')
+    p.add_argument('--extract-linear', action='store_true', help='Run linear extraction on each file and save results')
     args = p.parse_args()
     # Pass include_negative to main via environment prompt-handling: if user passed
     # --include-negative we will set the flag and avoid prompting inside main.
@@ -345,6 +517,9 @@ if __name__ == '__main__':
             pass
 
     try:
+        # If user requested linear extraction, set an environment flag used in main
+        if args.extract_linear:
+            os.environ['EXTRACT_LINEAR_IN_SWEEP'] = '1'
         main(directory=args.directory, pattern=args.pattern, out_dir=args.out, show=args.show)
     finally:
         # restore input if we patched it

@@ -146,9 +146,9 @@ class DiffusionLengthExtractor:
         ss_tot = np.sum((y - np.mean(y)) ** 2)
         return 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
 
-    def _detect_plateau_in_derivative(self, x_vals, deriv, min_plateau_length=3, 
+    def _detect_plateau_in_derivative(self, x_vals, deriv, min_plateau_length=10, 
                                       derivative_threshold=0.3, absolute_threshold=0.05,
-                                      search_from_end=False):
+                                      search_from_end=False, use_robust=True):
         """
         Detect plateau regions in the derivative where d(ln(I))/dx is approximately constant.
         A plateau indicates a linear region in log-space.
@@ -162,13 +162,15 @@ class DiffusionLengthExtractor:
         min_plateau_length : int
             Minimum number of points to consider a plateau (default: 5)
         derivative_threshold : float
-            Maximum allowed relative variation in derivative (as fraction of median, default: 0.3 = 30%)
+            Maximum allowed relative variation in derivative (as fraction of LOCAL median, default: 0.3)
         absolute_threshold : float
             Maximum allowed absolute variation in derivative (1/µm, default: 0.05)
-            This ensures detection works even when derivative is small
         search_from_end : bool
             If True, search from the tail inward (away from junction)
             If False, search from junction outward
+        use_robust : bool
+            If True, use LOCAL statistics (median and MAD) instead of global
+            This makes detection more robust to noise and outliers
         
         Returns
         -------
@@ -187,23 +189,25 @@ class DiffusionLengthExtractor:
         if np.sum(valid_mask) < min_plateau_length:
             return None, None, None
         
-        # Compute BOTH relative and absolute thresholds
-        deriv_abs = np.abs(deriv[valid_mask])
-        median_deriv = np.median(deriv_abs)
-        
-        # Relative threshold (adaptive to signal level)
-        if median_deriv == 0:
-            threshold_relative = 0.1  # fallback
+        if not use_robust:
+            # OLD METHOD: Use global median (sensitive to noise)
+            deriv_abs = np.abs(deriv[valid_mask])
+            median_deriv = np.median(deriv_abs)
+            
+            if median_deriv == 0:
+                threshold_relative = 0.1
+            else:
+                threshold_relative = derivative_threshold * median_deriv
+            
+            threshold = max(threshold_relative, absolute_threshold)
         else:
-            threshold_relative = derivative_threshold * median_deriv
+            # NEW ROBUST METHOD: Use local statistics (not used for threshold, 
+            # but for robust plateau detection - see below)
+            threshold = absolute_threshold  # Will use local criteria in the loop
         
-        # Use the MORE PERMISSIVE of the two thresholds
-        # This allows detection in both high-derivative and low-derivative regions
-        threshold = max(threshold_relative, absolute_threshold)
-        
-        # Smooth derivative for plateau detection (reduce noise)
+        # Use less smoothing to better match visible derivative
         from scipy.ndimage import uniform_filter1d
-        window = min(5, len(deriv) // 3)
+        window = min(3, len(deriv) // 5)
         if window < 3:
             window = 3
         deriv_smooth = uniform_filter1d(deriv.astype(float), size=window, mode='nearest')
@@ -227,19 +231,52 @@ class DiffusionLengthExtractor:
                 end = start + length
                 segment = deriv_smooth[start:end]
                 
-                # Check if segment is a plateau (low std deviation)
-                segment_mean = np.mean(segment)
-                segment_std = np.std(segment)
-                segment_range = np.max(segment) - np.min(segment)
+                if use_robust:
+                    # ROBUST METHOD: Use local median and MAD (Median Absolute Deviation)
+                    # MAD is much more robust to outliers than standard deviation
+                    segment_median = np.median(segment)
+                    segment_mad = np.median(np.abs(segment - segment_median))
+                    
+                    # Convert MAD to equivalent std (MAD * 1.4826 ≈ std for normal distribution)
+                    segment_robust_std = segment_mad * 1.4826
+                    
+                    # Use interquartile range for spread (more robust than range)
+                    q25, q75 = np.percentile(segment, [25, 75])
+                    segment_iqr = q75 - q25
+                    
+                    # LOCAL threshold based on the segment itself (not global median)
+                    # This adapts to the local derivative level
+                    local_threshold_rel = derivative_threshold * np.abs(segment_median) if segment_median != 0 else absolute_threshold
+                    local_threshold = max(local_threshold_rel, absolute_threshold)
+                    
+                    # Plateau criteria using robust statistics
+                    is_plateau = (segment_robust_std < local_threshold * 0.7 and 
+                                 segment_iqr < local_threshold * 1.2)
+                else:
+                    # OLD METHOD: Use mean, std, and range (sensitive to outliers)
+                    segment_mean = np.mean(segment)
+                    segment_std = np.std(segment)
+                    segment_range = np.max(segment) - np.min(segment)
+                    
+                    # Plateau criteria: tighter constraints for better derivative matching
+                    is_plateau = (segment_std < threshold * 0.8 and 
+                                 segment_range < 1.5 * threshold)
                 
-                # Plateau criteria: small std and small range relative to threshold
-                if segment_std < threshold and segment_range < 2 * threshold:
-                    # Prefer longer plateaus with smaller std
-                    if length > best_plateau_length or (length == best_plateau_length and segment_std < best_plateau_std):
+                if is_plateau:
+                    # Prefer plateau closest to zero (junction) with sufficient length
+                    # Accept if: no plateau yet, or closer to zero with reasonable quality
+                    if best_plateau_start is None:
+                        # First valid plateau found
                         best_plateau_start = start
                         best_plateau_end = end
                         best_plateau_length = length
-                        best_plateau_std = segment_std
+                        best_plateau_std = segment_robust_std if use_robust else segment_std
+                    elif start < best_plateau_start and length >= min_plateau_length:
+                        # Found a plateau closer to zero with acceptable length
+                        best_plateau_start = start
+                        best_plateau_end = end
+                        best_plateau_length = length
+                        best_plateau_std = segment_robust_std if use_robust else segment_std
         
         if best_plateau_start is not None:
             plateau_segment = deriv_smooth[best_plateau_start:best_plateau_end]
@@ -373,6 +410,13 @@ class DiffusionLengthExtractor:
         """
         x_vals = np.asarray(x_vals)
         y_vals = np.asarray(y_vals)
+        # preserve original experimental data for plotting overlays
+        y_raw = np.array(y_vals, dtype=float)
+
+        # Do NOT apply low-pass smoothing before fitting: keep the
+        # experimental data raw for all linear-on-log fitting per user request.
+        # Preserve the original experimental data for plotting overlays.
+        y_vals = np.asarray(y_vals)
 
         base_idx = int(np.argmax(y_vals))
         if intersection_idx is None:
@@ -407,8 +451,8 @@ class DiffusionLengthExtractor:
             left_x_raw = x_vals[:start_idx_left + 1]
             y_left_raw = y_vals[:start_idx_left + 1]
 
-            y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-            y_left_flipped = y_left_filtered[::-1]
+            # Use raw data for fitting (no pre-filtering)
+            y_left_flipped = np.array(y_left_raw, dtype=float)[::-1]
 
             try:
                 start_pos_left = float(left_x_raw[-1])
@@ -449,9 +493,10 @@ class DiffusionLengthExtractor:
             right_x_raw = x_vals[start_idx_right:]
             y_right_raw = y_vals[start_idx_right:]
 
-            y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
-            cut_idx = self._find_snr_end_index(y_right_filtered)
-            right_y_truncated = y_right_filtered[:cut_idx]
+            # Use raw data for fitting (no pre-filtering)
+            right_y_raw_arr = np.array(y_right_raw, dtype=float)
+            cut_idx = self._find_snr_end_index(right_y_raw_arr)
+            right_y_truncated = right_y_raw_arr[:cut_idx]
             try:
                 start_pos_right = float(right_x_raw[0])
                 right_x_local = np.array(right_x_raw, dtype=float) - start_pos_right
@@ -512,8 +557,8 @@ class DiffusionLengthExtractor:
         if best_left_idx is not None:
             left_x_raw = x_vals[:best_left_idx + 1]
             y_left_raw = y_vals[:best_left_idx + 1]
-            y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-            y_left_flipped = y_left_filtered[::-1]
+            # Use raw data for fitting (no pre-filtering)
+            y_left_flipped = np.array(y_left_raw, dtype=float)[::-1]
             try:
                 start_pos_left = float(left_x_raw[-1])
                 x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
@@ -538,10 +583,10 @@ class DiffusionLengthExtractor:
         if best_right_idx is not None:
             right_x_raw = x_vals[best_right_idx:]
             y_right_raw = y_vals[best_right_idx:]
-            y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
-
-            cut_idx = self._find_snr_end_index(y_right_filtered)
-            right_y_truncated = y_right_filtered[:cut_idx]
+            # Use raw data for fitting (no pre-filtering)
+            right_y_raw_arr = np.array(y_right_raw, dtype=float)
+            cut_idx = self._find_snr_end_index(right_y_raw_arr)
+            right_y_truncated = right_y_raw_arr[:cut_idx]
             try:
                 start_pos_right = float(right_x_raw[0])
                 right_x_local = np.array(right_x_raw, dtype=float) - start_pos_right
@@ -561,9 +606,9 @@ class DiffusionLengthExtractor:
 
         # --- Visualization: only tail truncations ---
         if plot_left and best_left_idx is not None:
-            self._plot_tailcut_fits(results, x_vals, y_vals, 'Left', base_idx, profile_id)
+            self._plot_tailcut_fits(results, x_vals, y_raw, 'Left', base_idx, profile_id)
         if plot_right and best_right_idx is not None:
-            self._plot_tailcut_fits(results, x_vals, y_vals, 'Right', base_idx, profile_id)
+            self._plot_tailcut_fits(results, x_vals, y_raw, 'Right', base_idx, profile_id)
 
         return results
 
@@ -1863,8 +1908,8 @@ class DiffusionLengthExtractor:
             left_x_raw = x_vals[:start_idx_left + 1]
             y_left_raw = y_vals[:start_idx_left + 1]
 
-            y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-            y_left_flipped = y_left_filtered[::-1]
+            # Use raw data for fitting (no pre-filtering)
+            y_left_flipped = np.array(y_left_raw, dtype=float)[::-1]
             try:
                 start_pos_left = float(left_x_raw[-1])
                 x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
@@ -1928,8 +1973,8 @@ class DiffusionLengthExtractor:
                     if side == 'Left':
                         left_x_raw = x_vals[:s + 1]
                         y_left_raw = y_vals[:s + 1]
-                        y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-                        y_left_flipped = y_left_filtered[::-1]
+                        # Use raw data for fitting (no pre-filtering)
+                        y_left_flipped = np.array(y_left_raw, dtype=float)[::-1]
                         try:
                             start_pos_left = float(left_x_raw[-1])
                             x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
@@ -2026,8 +2071,9 @@ class DiffusionLengthExtractor:
                     else:
                         right_x_raw = x_vals[s:]
                         y_right_raw = y_vals[s:]
-                        y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
-                        cut = len(y_right_filtered)
+                        # Use raw data for fitting (no pre-filtering)
+                        y_right_raw_arr = np.array(y_right_raw, dtype=float)
+                        cut = len(y_right_raw_arr)
                         max_w = min(max_window, cut)
                         if max_w < min_window:
                             continue
@@ -2043,7 +2089,7 @@ class DiffusionLengthExtractor:
                             x_right_local = np.array(right_x_raw, dtype=float)
                         for w in range(min_window, max_w + 1):
                             x_win = x_right_local[:w]
-                            y_win = y_right_filtered[:w]
+                            y_win = np.array(y_right_raw_arr[:w], dtype=float)
                             y_arr = np.array(y_win, dtype=float)
                             tail_n = min(10, max(3, len(y_arr) // 5))
                             if len(y_arr) <= max_window:
@@ -2112,8 +2158,8 @@ class DiffusionLengthExtractor:
                             if side == 'Left':
                                 left_x_raw = x_vals[:s2 + 1]
                                 y_left_raw = y_vals[:s2 + 1]
-                                y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-                                y_left_flipped = y_left_filtered[::-1]
+                                # Use raw data for fitting (no pre-filtering)
+                                y_left_flipped = np.array(y_left_raw, dtype=float)[::-1]
                                 try:
                                     start_pos_left = float(left_x_raw[-1])
                                     x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
@@ -2149,8 +2195,9 @@ class DiffusionLengthExtractor:
                             else:
                                 right_x_raw = x_vals[s2:]
                                 y_right_raw = y_vals[s2:]
-                                y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
-                                max_w2 = min(max_window, len(y_right_filtered))
+                                # Use raw data for fitting (no pre-filtering)
+                                y_right_raw_arr = np.array(y_right_raw, dtype=float)
+                                max_w2 = min(max_window, len(y_right_raw_arr))
                                 try:
                                     start_pos_right = float(right_x_raw[0])
                                     x_right_local = (np.array(right_x_raw, dtype=float) - start_pos_right)
@@ -2158,7 +2205,7 @@ class DiffusionLengthExtractor:
                                     x_right_local = np.array(right_x_raw, dtype=float)
                                 for w2 in range(min_window, max_w2 + 1):
                                     x_win = x_right_local[:w2]
-                                    y_win = y_right_filtered[:w2]
+                                    y_win = np.array(y_right_raw_arr[:w2], dtype=float)
                                     y_arr = np.array(y_win, dtype=float)
                                     tail_n = min(10, max(3, len(y_arr) // 5))
                                     if len(y_arr) <= max_window:
@@ -2247,9 +2294,10 @@ class DiffusionLengthExtractor:
             right_x_raw = x_vals[start_idx_right:]
             y_right_raw = y_vals[start_idx_right:]
 
-            y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
-            cut_idx = self._find_snr_end_index(y_right_filtered)
-            right_y_truncated = y_right_filtered[:cut_idx]
+            # Use raw data for fitting (no pre-filtering)
+            right_y_raw_arr = np.array(y_right_raw, dtype=float)
+            cut_idx = self._find_snr_end_index(right_y_raw_arr)
+            right_y_truncated = right_y_raw_arr[:cut_idx]
             try:
                 start_pos_right = float(right_x_raw[0])
                 right_x_truncated = (np.array(right_x_raw, dtype=float) - start_pos_right)[:cut_idx]
@@ -2284,8 +2332,8 @@ class DiffusionLengthExtractor:
                 start_idx_left = int(intersection_idx)
                 left_x_raw = x_vals[:start_idx_left + 1]
                 y_left_raw = y_vals[:start_idx_left + 1]
-                y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-                y_left_flipped = y_left_filtered[::-1]
+                # Use raw data for fitting (no pre-filtering)
+                y_left_flipped = np.array(y_left_raw, dtype=float)[::-1]
                 try:
                     start_pos_left = float(left_x_raw[-1])
                     x_left_flipped = (start_pos_left - np.array(left_x_raw, dtype=float))[::-1]
@@ -2322,9 +2370,10 @@ class DiffusionLengthExtractor:
                 start_idx_right = int(intersection_idx)
                 right_x_raw = x_vals[start_idx_right:]
                 y_right_raw = y_vals[start_idx_right:]
-                y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
-                cut_idx = self._find_snr_end_index(y_right_filtered)
-                right_y_truncated = y_right_filtered[:cut_idx]
+                # Use raw data for fitting (no pre-filtering)
+                right_y_raw_arr = np.array(y_right_raw, dtype=float)
+                cut_idx = self._find_snr_end_index(right_y_raw_arr)
+                right_y_truncated = right_y_raw_arr[:cut_idx]
                 try:
                     start_pos_right = float(right_x_raw[0])
                     right_x_truncated = (np.array(right_x_raw, dtype=float) - start_pos_right)[:cut_idx]
@@ -2362,8 +2411,8 @@ class DiffusionLengthExtractor:
                 if side == 'Left':
                     left_x_raw = x_vals[:start_idx + 1]
                     y_left_raw = y_vals[:start_idx + 1]
-                    y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-                    y_left_flipped = y_left_filtered[::-1]
+                    # Use raw data for fitting (no pre-filtering)
+                    y_left_flipped = np.array(y_left_raw, dtype=float)[::-1]
                     x_left_flipped = np.abs(left_x_raw)[::-1]
                     cut_idx = self._find_snr_end_index(y_left_flipped)
                     left_y_truncated = y_left_flipped[:cut_idx]
@@ -2378,9 +2427,10 @@ class DiffusionLengthExtractor:
                 else:
                     right_x_raw = x_vals[start_idx:]
                     y_right_raw = y_vals[start_idx:]
-                    y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
-                    cut_idx = self._find_snr_end_index(y_right_filtered)
-                    right_y_truncated = y_right_filtered[:cut_idx]
+                    # Use raw data for fitting (no pre-filtering)
+                    right_y_raw_arr = np.array(y_right_raw, dtype=float)
+                    cut_idx = self._find_snr_end_index(right_y_raw_arr)
+                    right_y_truncated = right_y_raw_arr[:cut_idx]
                     try:
                         start_pos_right = float(right_x_raw[0])
                         right_x_truncated = (np.array(right_x_raw, dtype=float) - start_pos_right)[:cut_idx]
@@ -2516,18 +2566,20 @@ class DiffusionLengthExtractor:
         
         results = []
         
-        # Prepare log-transformed data (NO FILTERING for plateau detection)
-        # Use raw data directly to preserve true signal characteristics
+        # Prepare log-transformed data. Use the RAW ln(I) for derivative
+        # computation and plateau detection — do not use any filtered
+        # current for depletion-region detection per user request.
         pos = y_vals[y_vals > 0]
         floor = max(np.min(pos) * 0.1, 1e-12) if pos.size > 0 else 1e-12
         y_safe = np.maximum(y_vals, floor)
         ln_y = np.log(y_safe)
-        
-        # Compute derivative d(ln(I))/dx using windowed gradient
+
+        # Compute derivative d(ln(I))/dx using windowed gradient on the
+        # RAW ln(I) (no filtering).
         try:
             dlnI_dx = gradient_with_window(x_vals, ln_y, window=gradient_window)
         except Exception as e:
-            print(f"Profile {profile_id}: Failed to compute gradient: {e}")
+            print(f"Profile {profile_id}: Failed to compute gradient on raw ln: {e}")
             return results
         
         # --- LEFT SIDE: Detect plateau from junction moving leftward ---
@@ -2561,7 +2613,7 @@ class DiffusionLengthExtractor:
             
             # Reject if plateau is too weak (< 10% of peak signal = likely noise floor)
             if signal_ratio < 0.10:
-                print(f"Profile {profile_id} Left: Rejected plateau at noise floor (signal={signal_ratio:.1%} of peak)")
+                # print(f"Profile {profile_id} Left: Rejected plateau at noise floor (signal={signal_ratio:.1%} of peak)")
                 plat_start_l, plat_end_l = None, None
             
             # Fit straight line to ln(I) in the plateau
@@ -2616,10 +2668,10 @@ class DiffusionLengthExtractor:
                     'r2': r2,
                     'plateau_indices': (orig_start, orig_end)
                 })
-                print(f"Profile {profile_id} Left: Detected plateau from index {orig_start} to {orig_end}, "
-                      f"slope={slope_log:.3g}, R²={r2:.3f}, inv_lambda={inv_lambda:.3g} µm")
+                # print(f"Profile {profile_id} Left: Detected plateau from index {orig_start} to {orig_end}, "
+                #       f"slope={slope_log:.3g}, R²={r2:.3f}, inv_lambda={inv_lambda:.3g} µm")
         else:
-            print(f"Profile {profile_id}: No left plateau detected")
+            pass  # print(f"Profile {profile_id}: No left plateau detected")
         
         # --- RIGHT SIDE: Detect plateau from junction moving rightward ---
         right_x = x_vals[intersection_idx:]
@@ -2654,7 +2706,7 @@ class DiffusionLengthExtractor:
             
             # Reject if plateau is too weak (< 10% of peak signal = likely noise floor)
             if signal_ratio < 0.10:
-                print(f"Profile {profile_id} Right: Rejected plateau at noise floor (signal={signal_ratio:.1%} of peak)")
+                # print(f"Profile {profile_id} Right: Rejected plateau at noise floor (signal={signal_ratio:.1%} of peak)")
                 plat_start_r, plat_end_r = None, None
             
             # Fit straight line to ln(I) in the plateau
@@ -2707,10 +2759,322 @@ class DiffusionLengthExtractor:
                     'r2': r2,
                     'plateau_indices': (orig_start, orig_end)
                 })
-                print(f"Profile {profile_id} Right: Detected plateau from index {orig_start} to {orig_end}, "
-                      f"slope={slope_log:.3g}, R²={r2:.3f}, inv_lambda={inv_lambda:.3g} µm")
+                # print(f"Profile {profile_id} Right: Detected plateau from index {orig_start} to {orig_end}, "
+                #       f"slope={slope_log:.3g}, R²={r2:.3f}, inv_lambda={inv_lambda:.3g} µm")
         else:
-            print(f"Profile {profile_id}: No right plateau detected")
+            pass  # print(f"Profile {profile_id}: No right plateau detected")
+        
+        return results
+
+    def fit_profile_sides_plateau_with_shift(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
+                                             gradient_window=3, min_plateau_length=5, 
+                                             derivative_threshold=0.4, absolute_threshold=0.1,
+                                             max_expansion=500, consecutive_drops=10):
+        """
+        HYBRID METHOD: Combines plateau detection with iterative expansion.
+        
+        This method:
+        1. Uses plateau detection to find initial linear regions
+        2. Iteratively expands boundaries outward as long as R² improves
+        3. Tolerates noise by requiring consecutive_drops decreases before stopping
+        4. Returns optimized linear fits with maximum valid extent
+        
+        Parameters
+        ----------
+        shift_range : int
+            Initial number of pixels to shift for quick refinement (default: 5)
+        max_expansion : int
+            Maximum number of pixels to expand beyond initial plateau (default: 30)
+        consecutive_drops : int
+            Number of consecutive R² decreases before stopping expansion (default: 3)
+        
+        Other parameters same as fit_profile_sides_plateau_based
+        """
+        from .perpendicular import gradient_with_window
+        
+        x_vals = np.asarray(x_vals, dtype=float)
+        y_vals = np.asarray(y_vals, dtype=float)
+        
+        base_idx = int(np.argmax(y_vals))
+        if intersection_idx is None:
+            intersection_idx = base_idx
+        
+        results = []
+        
+        # Prepare log-transformed data
+        pos = y_vals[y_vals > 0]
+        floor = max(np.min(pos) * 0.1, 1e-12) if pos.size > 0 else 1e-12
+        y_safe = np.maximum(y_vals, floor)
+        ln_y = np.log(y_safe)
+
+        # Compute derivative
+        try:
+            dlnI_dx = gradient_with_window(x_vals, ln_y, window=gradient_window)
+        except Exception as e:
+            print(f"Profile {profile_id}: Failed to compute gradient: {e}")
+            return results
+        
+        # --- LEFT SIDE: Detect initial plateau ---
+        left_x = x_vals[:intersection_idx + 1]
+        left_ln_y = ln_y[:intersection_idx + 1]
+        left_deriv = dlnI_dx[:intersection_idx + 1]
+        
+        left_x_flip = left_x[::-1]
+        left_ln_y_flip = left_ln_y[::-1]
+        left_deriv_flip = left_deriv[::-1]
+        
+        plat_start_l, plat_end_l, mean_deriv_l = self._detect_plateau_in_derivative(
+            left_x_flip, left_deriv_flip, 
+            min_plateau_length=min_plateau_length,
+            derivative_threshold=derivative_threshold,
+            absolute_threshold=absolute_threshold,
+            search_from_end=False
+        )
+        
+        if plat_start_l is not None and plat_end_l is not None:
+            # Map back to original indices
+            orig_start = intersection_idx - plat_end_l + 1
+            orig_end = intersection_idx - plat_start_l + 1
+            
+            # Helper function to fit a region and return R²
+            def fit_region_left(start_idx, end_idx):
+                if end_idx - start_idx < min_plateau_length:
+                    return None
+                x_test = x_vals[start_idx:end_idx]
+                ln_y_test = ln_y[start_idx:end_idx]
+                y_test = np.exp(ln_y_test)
+                
+                # Check signal level
+                peak_signal = np.max(y_vals)
+                test_mean_signal = np.mean(y_test)
+                if test_mean_signal / peak_signal < 0.10:
+                    return None
+                
+                try:
+                    p = np.polyfit(x_test, ln_y_test, 1)
+                    ln_fit = np.polyval(p, x_test)
+                    r2 = self._calculate_r2(ln_y_test, ln_fit)
+                    return {'start': start_idx, 'end': end_idx, 'r2': r2, 
+                            'x': x_test, 'ln_y': ln_y_test, 'y': y_test,
+                            'slope': float(p[0]), 'intercept': float(p[1]), 'ln_fit': ln_fit}
+                except Exception:
+                    return None
+            
+            # Start with plateau region
+            best_fit_l = fit_region_left(orig_start, orig_end)
+            if best_fit_l is None:
+                best_fit_l = None
+            else:
+                best_r2_l = best_fit_l['r2']
+                
+                # Iteratively expand both boundaries
+                drops_start = 0
+                drops_end = 0
+                
+                # Expand toward tail (decrease start_idx) while R² improves
+                for expansion in range(1, max_expansion + 1):
+                    new_start = max(0, orig_start - expansion)
+                    if new_start == best_fit_l['start']:  # Can't expand further
+                        break
+                    
+                    candidate = fit_region_left(new_start, best_fit_l['end'])
+                    if candidate is None:
+                        drops_start += 1
+                    elif candidate['r2'] > best_r2_l:
+                        # Improvement! Update best fit and reset counter
+                        best_fit_l = candidate
+                        best_r2_l = candidate['r2']
+                        drops_start = 0
+                    else:
+                        # R² decreased
+                        drops_start += 1
+                    
+                    if drops_start >= consecutive_drops:
+                        break
+                
+                # Expand toward junction (increase end_idx) while R² improves
+                for expansion in range(1, max_expansion + 1):
+                    new_end = min(intersection_idx + 1, best_fit_l['end'] + expansion)
+                    if new_end == best_fit_l['end']:  # Can't expand further
+                        break
+                    
+                    candidate = fit_region_left(best_fit_l['start'], new_end)
+                    if candidate is None:
+                        drops_end += 1
+                    elif candidate['r2'] > best_r2_l:
+                        # Improvement! Update best fit and reset counter
+                        best_fit_l = candidate
+                        best_r2_l = candidate['r2']
+                        drops_end = 0
+                    else:
+                        # R² decreased
+                        drops_end += 1
+                    
+                    if drops_end >= consecutive_drops:
+                        break
+                
+                # Build final fit dict
+                if best_fit_l is not None:
+                    slope_log = best_fit_l['slope']
+                    intercept_log = best_fit_l['intercept']
+                    inv_lambda_um = np.inf if slope_log == 0 else 1.0 / abs(slope_log)
+                    pixel_size_um = self.pixel_size * 1e6
+                    if np.isfinite(inv_lambda_um) and pixel_size_um > 0:
+                        inv_lambda = max(round(inv_lambda_um / pixel_size_um) * pixel_size_um, pixel_size_um)
+                    else:
+                        inv_lambda = inv_lambda_um
+                    
+                    fit_curve_global = np.exp(best_fit_l['ln_fit'])
+                    
+                    best_fit_l = {
+                        'side': 'Left (plateau+expand)',
+                        'shift': 0,
+                        'x_vals': best_fit_l['x'] - best_fit_l['x'][-1],
+                        'y_vals': best_fit_l['y'],
+                        'fit_curve': fit_curve_global,
+                        'fit_curve_local': fit_curve_global,
+                        'ln_fit_curve': best_fit_l['ln_fit'],
+                        'global_x_vals': best_fit_l['x'],
+                        'parameters': (slope_log, intercept_log),
+                        'slope': slope_log,
+                        'intercept': intercept_log,
+                        'inv_lambda': inv_lambda,
+                        'r2': best_r2_l,
+                        'plateau_indices': (best_fit_l['start'], best_fit_l['end'])
+                    }
+                    results.append(best_fit_l)
+        
+        # --- RIGHT SIDE: Detect initial plateau and shift ---
+        right_x = x_vals[intersection_idx:]
+        right_ln_y = ln_y[intersection_idx:]
+        right_deriv = dlnI_dx[intersection_idx:]
+        
+        search_limit = max(min_plateau_length + 5, int(len(right_x) * 0.7))
+        right_x_limited = right_x[:search_limit]
+        right_ln_y_limited = right_ln_y[:search_limit]
+        right_deriv_limited = right_deriv[:search_limit]
+        
+        plat_start_r, plat_end_r, mean_deriv_r = self._detect_plateau_in_derivative(
+            right_x_limited, right_deriv_limited,
+            min_plateau_length=min_plateau_length,
+            derivative_threshold=derivative_threshold,
+            absolute_threshold=absolute_threshold,
+            search_from_end=False
+        )
+        
+        if plat_start_r is not None and plat_end_r is not None:
+            # Map to original indices
+            orig_start = intersection_idx + plat_start_r
+            orig_end = intersection_idx + plat_end_r
+            
+            # Helper function to fit a region and return R²
+            def fit_region_right(start_idx, end_idx):
+                if end_idx - start_idx < min_plateau_length:
+                    return None
+                x_test = x_vals[start_idx:end_idx]
+                ln_y_test = ln_y[start_idx:end_idx]
+                y_test = np.exp(ln_y_test)
+                
+                # Check signal level
+                peak_signal = np.max(y_vals)
+                test_mean_signal = np.mean(y_test)
+                if test_mean_signal / peak_signal < 0.10:
+                    return None
+                
+                try:
+                    x_local = x_test - x_test[0]
+                    p = np.polyfit(x_local, ln_y_test, 1)
+                    ln_fit = np.polyval(p, x_local)
+                    r2 = self._calculate_r2(ln_y_test, ln_fit)
+                    return {'start': start_idx, 'end': end_idx, 'r2': r2,
+                            'x': x_test, 'x_local': x_local, 'ln_y': ln_y_test, 'y': y_test,
+                            'slope': float(p[0]), 'intercept': float(p[1]), 'ln_fit': ln_fit}
+                except Exception:
+                    return None
+            
+            # Start with plateau region
+            best_fit_r = fit_region_right(orig_start, orig_end)
+            if best_fit_r is None:
+                best_fit_r = None
+            else:
+                best_r2_r = best_fit_r['r2']
+                
+                # Iteratively expand both boundaries
+                drops_start = 0
+                drops_end = 0
+                
+                # Expand toward junction (decrease start_idx) while R² improves
+                for expansion in range(1, max_expansion + 1):
+                    new_start = max(intersection_idx, best_fit_r['start'] - expansion)
+                    if new_start == best_fit_r['start']:  # Can't expand further
+                        break
+                    
+                    candidate = fit_region_right(new_start, best_fit_r['end'])
+                    if candidate is None:
+                        drops_start += 1
+                    elif candidate['r2'] > best_r2_r:
+                        # Improvement! Update best fit and reset counter
+                        best_fit_r = candidate
+                        best_r2_r = candidate['r2']
+                        drops_start = 0
+                    else:
+                        # R² decreased
+                        drops_start += 1
+                    
+                    if drops_start >= consecutive_drops:
+                        break
+                
+                # Expand toward tail (increase end_idx) while R² improves
+                for expansion in range(1, max_expansion + 1):
+                    new_end = min(len(x_vals), best_fit_r['end'] + expansion)
+                    if new_end == best_fit_r['end']:  # Can't expand further
+                        break
+                    
+                    candidate = fit_region_right(best_fit_r['start'], new_end)
+                    if candidate is None:
+                        drops_end += 1
+                    elif candidate['r2'] > best_r2_r:
+                        # Improvement! Update best fit and reset counter
+                        best_fit_r = candidate
+                        best_r2_r = candidate['r2']
+                        drops_end = 0
+                    else:
+                        # R² decreased
+                        drops_end += 1
+                    
+                    if drops_end >= consecutive_drops:
+                        break
+                
+                # Build final fit dict
+                if best_fit_r is not None:
+                    slope_log = best_fit_r['slope']
+                    intercept_log = best_fit_r['intercept']
+                    inv_lambda_um = np.inf if slope_log == 0 else 1.0 / abs(slope_log)
+                    pixel_size_um = self.pixel_size * 1e6
+                    if np.isfinite(inv_lambda_um) and pixel_size_um > 0:
+                        inv_lambda = max(round(inv_lambda_um / pixel_size_um) * pixel_size_um, pixel_size_um)
+                    else:
+                        inv_lambda = inv_lambda_um
+                    
+                    fit_curve_global = np.exp(best_fit_r['ln_fit'])
+                    
+                    best_fit_r = {
+                        'side': 'Right (plateau+expand)',
+                        'shift': 0,
+                        'x_vals': best_fit_r['x_local'],
+                        'y_vals': best_fit_r['y'],
+                        'fit_curve': fit_curve_global,
+                        'fit_curve_local': fit_curve_global,
+                        'ln_fit_curve': best_fit_r['ln_fit'],
+                        'global_x_vals': best_fit_r['x'],
+                        'parameters': (slope_log, intercept_log),
+                        'slope': slope_log,
+                        'intercept': intercept_log,
+                        'inv_lambda': inv_lambda,
+                        'r2': best_r2_r,
+                        'plateau_indices': (best_fit_r['start'], best_fit_r['end'])
+                    }
+                    results.append(best_fit_r)
         
         return results
 
@@ -2761,7 +3125,10 @@ class DiffusionLengthExtractor:
 
         return results
 
-    def fit_all_profiles_linear(self, use_plateau_detection=True):
+    def fit_all_profiles_linear(self, use_plateau_detection=True, use_shifting=False,
+                                 gradient_window=9, min_plateau_length=5,
+                                 derivative_threshold=0.3, absolute_threshold=0.03,
+                                 max_expansion=30, consecutive_drops=3):
         """
         Run linear-on-log fitting for all loaded profiles and populate self.results
         similarly to fit_all_profiles.
@@ -2771,26 +3138,62 @@ class DiffusionLengthExtractor:
         use_plateau_detection : bool
             If True, use derivative plateau detection (NEW METHOD - recommended)
             If False, use the old iterative window search method
+        use_shifting : bool
+            If True, use hybrid plateau+shifting method to refine fits
+            Only applies when use_plateau_detection=True
+        gradient_window : int
+            Window size for gradient computation in plateau detection
+        min_plateau_length : int
+            Minimum number of points for a valid plateau
+        derivative_threshold : float
+            Maximum relative variation in derivative for plateau detection
+        absolute_threshold : float
+            Maximum absolute variation in derivative (1/µm)
+        max_expansion : int
+            Maximum number of pixels to expand beyond initial plateau (default: 30)
+        consecutive_drops : int
+            Number of consecutive R² decreases before stopping expansion (default: 3)
         """
         self.results = []
         self.inv_lambdas = []
         self.central_inv_lambdas = []
+        
+        # Store parameters for use in plotting
+        self.plateau_params = {
+            'gradient_window': gradient_window,
+            'min_plateau_length': min_plateau_length,
+            'derivative_threshold': derivative_threshold,
+            'absolute_threshold': absolute_threshold
+        }
 
         for i, prof in enumerate(self.profiles):
             intersection_idx = prof.get('intersection_idx', None)
             x_vals = np.array(prof['dist_um'])
             y_vals = np.array(prof['current'])
 
-            if use_plateau_detection:
-                # NEW: Use derivative plateau detection
+            if use_plateau_detection and use_shifting:
+                # HYBRID: Use plateau detection + iterative expansion for refinement
+                sides = self.fit_profile_sides_plateau_with_shift(
+                    x_vals, y_vals,
+                    intersection_idx=intersection_idx,
+                    profile_id=i + 1,
+                    gradient_window=gradient_window,
+                    min_plateau_length=min_plateau_length,
+                    derivative_threshold=derivative_threshold,
+                    absolute_threshold=absolute_threshold,
+                    max_expansion=max_expansion,
+                    consecutive_drops=consecutive_drops
+                )
+            elif use_plateau_detection:
+                # NEW: Use derivative plateau detection only
                 sides = self.fit_profile_sides_plateau_based(
                     x_vals, y_vals,
                     intersection_idx=intersection_idx,
                     profile_id=i + 1,
-                    gradient_window=9,
-                    min_plateau_length=5,
-                    derivative_threshold=0.2,
-                    absolute_threshold=0.05  # 0.05 1/µm absolute tolerance
+                    gradient_window=gradient_window,
+                    min_plateau_length=min_plateau_length,
+                    derivative_threshold=derivative_threshold,
+                    absolute_threshold=absolute_threshold
                 )
             else:
                 # OLD: Use iterative window search

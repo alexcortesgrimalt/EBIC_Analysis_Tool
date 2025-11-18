@@ -127,9 +127,14 @@ def calculate_perpendicular_profiles(line_coords, num_lines, length_um,
     return profiles
 
 
-def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
+def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None, debug=False):
     """
     Plot perpendicular lines and scrollable profile plots.
+    
+    Parameters
+    ----------
+    debug : bool
+        If True, print debug information during plotting
     """
     if not profiles: return
     if ax is not None and fig is not None:
@@ -174,10 +179,11 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
         cur_vals = prof["current"]
         sem_vals_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals)+1e-12)
         # Debug print: basic profile info
-        try:
-            print(f"[perp] profile id={prof.get('id')} n_points={len(dist_um)}")
-        except Exception:
-            print("[perp] profile (id unknown) starting plot")
+        if debug:
+            try:
+                print(f"[perp] profile id={prof.get('id')} n_points={len(dist_um)}")
+            except Exception:
+                print("[perp] profile (id unknown) starting plot")
         # Create a 3-row plot: top = SEM (normalized) + Current (linear) via twin y,
         # middle = log10(Current), bottom = derivatives (dI/dx and dlnI/dx)
         fig_prof, (ax1, ax_log, ax_der) = plt.subplots(3, 1, sharex=True, figsize=(6, 7), gridspec_kw={'height_ratios': [1, 1, 0.8]})
@@ -188,10 +194,11 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
         cur = np.array(cur_vals)
         ax1b.plot(dist_um, cur, color='tab:red', linewidth=1.2, label='Current (nA)')
         # Debug: current stats
-        try:
-            print(f"[perp] current: min={np.nanmin(cur):.3e} max={np.nanmax(cur):.3e} mean={np.nanmean(cur):.3e}")
-        except Exception:
-            print("[perp] current: could not compute stats")
+        if debug:
+            try:
+                print(f"[perp] current: min={np.nanmin(cur):.3e} max={np.nanmax(cur):.3e} mean={np.nanmean(cur):.3e}")
+            except Exception:
+                print("[perp] current: could not compute stats")
 
         # Prepare safe current for plotting and set log y-scale on middle axis
         pos = cur[cur > 0]
@@ -201,7 +208,8 @@ def plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=None):
             floor = 1e-12
         cur_safe = np.maximum(cur, floor)
         # Debug: floor used for log-safe current
-        print(f"[perp] log-floor used = {floor:.3e} (pos_count={pos.size})")
+        if debug:
+            print(f"[perp] log-floor used = {floor:.3e} (pos_count={pos.size})")
 
         # Plot raw current values but use a logarithmic y-axis for the middle subplot
         ax_log.plot(dist_um, cur_safe, color='tab:orange', linewidth=1.5, label='Current (nA)')

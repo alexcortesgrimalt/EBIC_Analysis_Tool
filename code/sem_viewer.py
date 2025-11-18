@@ -1042,10 +1042,10 @@ class SEMViewer:
                         # If this dataset is the one currently displayed, draw overlays on the main viewer
                         cur_display_idx = int(self.sweep_index) if getattr(self, 'sweep_index', None) is not None else 0
                         if i == cur_display_idx and hasattr(self, 'ax') and hasattr(self, 'fig'):
-                            plot_perpendicular_profiles(profiles, ax=self.ax, fig=self.fig, source_name=ds.get('sample_name'))
+                            plot_perpendicular_profiles(profiles, ax=self.ax, fig=self.fig, source_name=ds.get('sample_name'), debug=False)
                         else:
                             # just open/save the perpendicular plots for other datasets
-                            plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=ds.get('sample_name'))
+                            plot_perpendicular_profiles(profiles, ax=None, fig=None, source_name=ds.get('sample_name'), debug=False)
                     except Exception as e:
                         print(f"Failed to plot perpendiculars for dataset {i}: {e}")
 
@@ -1191,7 +1191,7 @@ class SEMViewer:
         # draws the perpendicular lines on the main viewer (if ax/fig passed)
         # and opens a scrollable window with stacked SEM + log10(Current) plots.
         try:
-            plot_perpendicular_profiles(profiles, ax=getattr(self, 'ax', None), fig=getattr(self, 'fig', None))
+            plot_perpendicular_profiles(profiles, ax=getattr(self, 'ax', None), fig=getattr(self, 'fig', None), debug=False)
         except Exception as e:
             print("Failed to open stacked perpendicular plots, falling back to simple plots:", e)
             # Fallback: draw simple twin-y plots as before
@@ -1541,13 +1541,13 @@ class SEMViewer:
 
             ref_idx = int(self.sweep_index) if self.sweep_index is not None else 0
 
-            print(f"Starting sweep detection on {n} datasets (ref idx {ref_idx})...")
+            # print(f"Starting sweep detection on {n} datasets (ref idx {ref_idx})...")
             for i, ds in enumerate(self.sweep_datasets):
                 try:
                     pm_list = ds.get('pixel_maps', [])
                     cm_list = ds.get('current_maps', [])
                     if not pm_list:
-                        print(f"Dataset {i} missing pixel maps, skipping.")
+                        # print(f"Dataset {i} missing pixel maps, skipping.")
                         continue
                     sem_data = pm_list[self.index] if (self.index is not None and self.index < len(pm_list)) else pm_list[0]
 
@@ -1571,7 +1571,7 @@ class SEMViewer:
                         roi_current = None
 
                     analyzer = JunctionAnalyzer(pixel_size_m=ds.get('pixel_size', self.pixel_size))
-                    results = analyzer.detect(roi, mapped_dense, roi_current=roi_current, weight_current=self.ebic_weight)
+                    results = analyzer.detect(roi, mapped_dense, roi_current=roi_current, weight_current=self.ebic_weight, debug=False)
                     if results:
                         best = results[0]
                         # best is expected to be (label, coords, metrics)
@@ -1585,11 +1585,11 @@ class SEMViewer:
                             profiles = calculate_perpendicular_profiles(mapped_dense, int(num_lines), float(length_um), sem_data, cm_list[1] if (cm_list and len(cm_list) > 1) else None, pixel_size_m=ds.get('pixel_size', self.pixel_size), detected_junction=detected_coords, source_name=ds.get('sample_name'))
                             perp_list[i] = profiles
                         except Exception as e:
-                            print(f"Failed to compute perpendiculars for dataset {i}: {e}")
+                            pass  # print(f"Failed to compute perpendiculars for dataset {i}: {e}")
                     else:
-                        print(f"No detection result for dataset {i}.")
+                        pass  # print(f"No detection result for dataset {i}.")
                 except Exception as e:
-                    print(f"Error processing dataset {i}: {e}")
+                    pass  # print(f"Error processing dataset {i}: {e}")
 
             # Persist results
             self.sweep_detected_coords = detected_list
@@ -1618,7 +1618,7 @@ class SEMViewer:
             except Exception:
                 self.perpendicular_profiles = []
 
-            print("Sweep detection finished.")
+            # print("Sweep detection finished.")
             # Optionally open debug view automatically if enabled
             try:
                 if getattr(self, 'debug_mode', False):

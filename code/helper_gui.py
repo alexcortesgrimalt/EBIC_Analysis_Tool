@@ -19,6 +19,88 @@ from .Junction_Analyser import JunctionAnalyzer
 from .ROI_extractor import extract_line_rectangle
 from .perpendicular import calculate_perpendicular_profiles, plot_perpendicular_profiles, gradient_with_window
 
+
+def _extract_bias_voltage(sample_name):
+    """
+    Extract bias voltage from sample name.
+    
+    Rules:
+    - 'noVb' -> 0
+    - 'Vb0X' (e.g., Vb01, Vb02) -> 0.X (e.g., 0.1, 0.2)
+    - 'VbX' (e.g., Vb1, Vb2) -> X (e.g., 1, 2)
+    - '0XVb' (e.g., 01Vb, 02Vb) -> 0.X (e.g., 0.1, 0.2)
+    
+    Args:
+        sample_name: Sample name string
+        
+    Returns:
+        float: Bias voltage value, or None if not found
+    """
+    import re
+    
+    if not sample_name:
+        return None
+    
+    name_lower = sample_name.lower()
+    
+    # Check for 'noVb' or 'novb'
+    if 'novb' in name_lower:
+        return 0.0
+    
+    # Pattern 1: Vb followed by digits (e.g., Vb01, Vb1, Vb2)
+    match = re.search(r'vb0*(\d+)', name_lower)
+    if match:
+        value_str = match.group(1)
+        value = int(value_str)
+        # If original had leading zero (Vb01, Vb02), treat as decimal
+        if match.group(0).startswith('vb0') and len(value_str) >= 1:
+            return value / 10.0
+        else:
+            return float(value)
+    
+    # Pattern 2: Digits followed by Vb (e.g., 01Vb, 02Vb)
+    match = re.search(r'0(\d+)vb', name_lower)
+    if match:
+        value = int(match.group(1))
+        return value / 10.0
+    
+    return None
+
+
+def _get_common_folder_name(viewer):
+    """
+    Extract a common folder name from the viewer's data:
+    - If sweep_datasets exist, find the common prefix among all sample names
+    - Otherwise, use the current sample_name
+    
+    Returns:
+        str: Folder name to use for outputs
+    """
+    if hasattr(viewer, 'sweep_datasets') and viewer.sweep_datasets:
+        # Extract all sample names
+        names = [ds.get('sample_name', '') for ds in viewer.sweep_datasets]
+        # Filter out empty names
+        names = [n for n in names if n]
+        if not names:
+            return viewer.sample_name
+        
+        # Find common prefix
+        if len(names) == 1:
+            return names[0]
+        
+        # Find the longest common prefix
+        common = os.path.commonprefix(names)
+        # Remove trailing underscores or hyphens
+        common = common.rstrip('_-')
+        # If common prefix is too short or empty, use first name
+        if len(common) < 3:
+            return names[0]
+        return common
+    else:
+        # Single dataset, use its sample name
+        return viewer.sample_name
+
+
 def ask_junction_width():
     """
     Show dialog to ask for junction width.
@@ -319,13 +401,13 @@ def fit_perpendicular_profiles(viewer):
     extractor = DiffusionLengthExtractor(pixel_size, smoothing_sigma=1)
     extractor.load_profiles(viewer.perpendicular_profiles)
     extractor.fit_all_profiles()
-    extractor.visualize_fitted_profiles()
+    # extractor.visualize_fitted_profiles()
     # Also show log(EBIC) vs distance plots (saved to disk)
-    try:
-        extractor.visualize_log_profiles()
-    except Exception as e:
-        print("Error while plotting log profiles:", e)
-    extractor.visualize_depletion_regions()
+    # try:
+    #     extractor.visualize_log_profiles()
+    # except Exception as e:
+    #     print("Error while plotting log profiles:", e)
+    # extractor.visualize_depletion_regions()
     averages = extractor.compute_average_lengths(show_table=True)
     
     return averages
@@ -358,12 +440,24 @@ def fit_perpendicular_profiles_linear(viewer):
     extractor.load_profiles(viewer.perpendicular_profiles)
 
     # Run the linear fitting pipeline for all profiles
-    extractor.fit_all_profiles_linear()
+    # Parameters for plateau detection and expansion:
+    extractor.fit_all_profiles_linear(
+        use_plateau_detection=True,   # Use derivative plateau method
+        use_shifting=True,             # Enable iterative expansion
+        gradient_window=11,             # Window size for derivative
+        min_plateau_length=5,         # Minimum plateau size
+        derivative_threshold=0.22,      # Max relative variation in derivative
+        absolute_threshold=0.03,       # Max absolute variation (1/µm)
+        max_expansion=1000,              # Max pixels to expand beyond plateau
+        consecutive_drops=30            # Stop after 10 consecutive R² drops
+    )
 
     summaries = []
-    # Ensure output dir for saved figures (matches other code)
-    out_dir = os.path.join(os.getcwd(), 'depletion_plots')
+    # Create output directory using common name from files
+    folder_name = _get_common_folder_name(viewer)
+    out_dir = os.path.join(os.getcwd(), 'depletion_plots', folder_name)
     os.makedirs(out_dir, exist_ok=True)
+    print(f"Saving linear fit results to: {out_dir}")
 
     for res in extractor.results:
         profile_idx = res.get('Profile')
@@ -382,8 +476,19 @@ def fit_perpendicular_profiles_linear(viewer):
         right_start = depletion.get('right_start')
         depletion_width = depletion.get('depletion_width')
 
+        # Extract source_name from the profile if available (for sweep analysis)
+        profile_source_name = None
+        if profile_idx > 0 and profile_idx <= len(viewer.perpendicular_profiles):
+            profile_entry = viewer.perpendicular_profiles[profile_idx - 1]
+            profile_source_name = profile_entry.get('source_name', None)
+        
+        # Fallback to viewer.sample_name if no source_name in profile
+        if not profile_source_name:
+            profile_source_name = viewer.sample_name
+        
         summaries.append({
             'profile': profile_idx,
+            'sample_name': profile_source_name,
             'left_slope': left_slope,
             'left_r2': left_r2,
             'right_slope': right_slope,
@@ -406,17 +511,29 @@ def fit_perpendicular_profiles_linear(viewer):
                 base_idx = int(intersection_idx)
             else:
                 ref = float(x[base_idx])
-            # Build ln(current) - NO FILTERING, use raw data
-            # Use raw data directly to see true signal characteristics
+            # Build ln(current) from raw data and also compute filtered version
             pos = y[y > 0]
             floor = max(np.min(pos) * 0.1, 1e-12) if pos.size > 0 else 1e-12
             y_safe = np.maximum(y, floor)
             ln_y = np.log(y_safe)
 
+            # Compute filtered signal (used internally for fits) and its ln
+            try:
+                y_filtered = extractor.apply_low_pass_filter(y, visualize=False)
+                y_filtered_safe = np.maximum(y_filtered, floor)
+                ln_y_filtered = np.log(y_filtered_safe)
+            except Exception:
+                y_filtered = None
+                ln_y_filtered = None
+
             # Create a 2-row figure: top = ln(Current) and fits, bottom = derivatives
             fig, (ax, ax_der) = plt.subplots(2, 1, sharex=True, figsize=(8, 6), gridspec_kw={'height_ratios': [2, 1]})
             x_plot = x - ref
-            ax.plot(x_plot, ln_y, 'k.-', label='ln(Current)')
+            # Plot raw ln(Current)
+            ax.plot(x_plot, ln_y, 'k.-', label='ln(Current) (raw)')
+            # Plot filtered ln(Current) if available (smooth line)
+            if ln_y_filtered is not None:
+                ax.plot(x_plot, ln_y_filtered, color='tab:orange', lw=1.8, alpha=0.9, label='ln(Current) (filtered)')
 
             # Overlay best-left/right fits (transform their fit_curves to plotting coords)
             if best_left is not None:
@@ -476,12 +593,16 @@ def fit_perpendicular_profiles_linear(viewer):
             ax.grid(True, linestyle='--', alpha=0.4)
 
             # --- Derivative panel: d(lnI)/dx ---
-            # Use windowed gradient for smoother derivatives
-            gradient_window = 9
+            # Use windowed gradient for smoother derivatives. Compute the
+            # derivative from the RAW ln(Current) to match plateau detection.
+            # IMPORTANT: These parameters are extracted from the extractor to match plateau detection
+            gradient_window = extractor.plateau_params.get('gradient_window', 9)
             try:
                 x_vals_plot = np.array(x_plot, dtype=float)
                 if x_vals_plot.size > 1:
-                    dln_meas = gradient_with_window(x_vals_plot, ln_y, window=gradient_window)
+                    # Use RAW ln(y) to match plateau detection (no filtering)
+                    source_ln = ln_y
+                    dln_meas = gradient_with_window(x_vals_plot, source_ln, window=gradient_window)
                 else:
                     dln_meas = np.zeros_like(x_vals_plot)
             except Exception:
@@ -567,18 +688,33 @@ def fit_perpendicular_profiles_linear(viewer):
             print(f"Failed plotting profile {profile_idx}: {e}")
             continue
 
-    # Save summary CSV for all profiles
+    # Save summary CSV for all profiles with physical properties
+    # Append mode: accumulate results across multiple analyses (especially for sweeps)
     import csv
-    summary_path = os.path.join(out_dir, 'perp_linear_summary.csv')
+    summary_path = os.path.join(out_dir, 'physical_properties_linear_fits.csv')
     try:
-        with open(summary_path, 'w', newline='') as cf:
+        # Check if file exists to determine if we need to write header
+        file_exists = os.path.isfile(summary_path)
+        
+        with open(summary_path, 'a', newline='') as cf:
             writer = csv.writer(cf)
-            writer.writerow(['profile', 'left_slope', 'left_r2', 'right_slope', 'right_r2', 'left_start', 'right_start', 'depletion_width'])
+            
+            # Write header only if file is new
+            if not file_exists:
+                writer.writerow(['sample_name', 'bias_V', 'profile', 'left_slope_1_per_um', 'left_r2', 'right_slope_1_per_um', 'right_r2', 
+                               'left_edge_um', 'right_edge_um', 'depletion_width_um'])
+            
+            # Write data rows - each summary now contains its own sample_name (from profile source_name)
             for s in summaries:
-                writer.writerow([s['profile'], s['left_slope'], s['left_r2'], s['right_slope'], s['right_r2'], s['left_start'], s['right_start'], s['depletion_width']])
-        print(f"Saved linear fit summary to {summary_path}")
+                sample_name = s.get('sample_name', viewer.sample_name)
+                bias_voltage = _extract_bias_voltage(sample_name)
+                writer.writerow([sample_name, bias_voltage, s['profile'], s['left_slope'], s['left_r2'], s['right_slope'], s['right_r2'], 
+                               s['left_start'], s['right_start'], s['depletion_width']])
+        
+        action = "Appended" if file_exists else "Saved"
+        print(f"{action} physical properties (depletion range & slopes) to {summary_path}")
     except Exception as e:
-        print(f"Failed to save linear summary CSV: {e}")
+        print(f"Failed to save physical properties CSV: {e}")
 
     # Also print a human-readable table to the console for quick inspection
     try:
@@ -714,7 +850,7 @@ def generate_perpendicular_profiles(viewer, num_lines, length_um):
     )
     
     viewer.perpendicular_profiles = profiles
-    plot_perpendicular_profiles(profiles, ax=viewer.ax, fig=viewer.fig, source_name=getattr(viewer, 'sample_name', None))
+    plot_perpendicular_profiles(profiles, ax=viewer.ax, fig=viewer.fig, source_name=getattr(viewer, 'sample_name', None), debug=False)
     # Also save log(EBIC) vs distance plots for the generated perpendicular profiles
     try:
         pixel_size = getattr(viewer, 'pixel_size', 1e-6)

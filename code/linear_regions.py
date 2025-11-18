@@ -87,7 +87,6 @@ def extract_linear_regions(x, y, smooth_window=None, polyorder=3, debug=False):
     # Smooth y with Savitzky-Golay to reduce noise in derivatives
     # Choose window_length automatically if not provided: odd and <= n-1
     if smooth_window is None:
-        # window ~ max(5, odd fraction of n)
         w = max(5, int(np.clip(n // 15, 5, 51)))
         if w % 2 == 0:
             w += 1
