@@ -722,6 +722,9 @@ class DiffusionLengthExtractor:
             # include chosen fits so callers can visualize the selected fit curves
             "best_left_fit": best_left,
             "best_right_fit": best_right,
+            # Include original plateau boundaries before expansion
+            "left_plateau_original": best_left.get('plateau_original') if best_left else None,
+            "right_plateau_original": best_right.get('plateau_original') if best_right else None,
         }
 
     def fit_all_profiles(self):
@@ -2769,7 +2772,8 @@ class DiffusionLengthExtractor:
     def fit_profile_sides_plateau_with_shift(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
                                              gradient_window=3, min_plateau_length=5, 
                                              derivative_threshold=0.4, absolute_threshold=0.1,
-                                             max_expansion=500, consecutive_drops=10):
+                                             max_expansion=500, consecutive_drops=10,
+                                             junction_precision=True):
         """
         HYBRID METHOD: Combines plateau detection with iterative expansion.
         
@@ -2778,6 +2782,11 @@ class DiffusionLengthExtractor:
         2. Iteratively expands boundaries outward as long as R² improves
         3. Tolerates noise by requiring consecutive_drops decreases before stopping
         4. Returns optimized linear fits with maximum valid extent
+        
+        If junction_precision=True:
+        - Starts FROM the junction and detects where linearity begins
+        - Uses strict criteria (R² > 0.95, stable derivative) to avoid non-linear depletion region
+        - Critical for precise detection of linear diffusion region onset
         
         Parameters
         ----------
@@ -2790,7 +2799,10 @@ class DiffusionLengthExtractor:
         
         Other parameters same as fit_profile_sides_plateau_based
         """
-        from .perpendicular import gradient_with_window
+        try:
+            from .perpendicular import gradient_with_window
+        except ImportError:
+            from perpendicular import gradient_with_window
         
         x_vals = np.asarray(x_vals, dtype=float)
         y_vals = np.asarray(y_vals, dtype=float)
@@ -2836,6 +2848,116 @@ class DiffusionLengthExtractor:
             orig_start = intersection_idx - plat_end_l + 1
             orig_end = intersection_idx - plat_start_l + 1
             
+            # NEW: Find where linearity actually starts from the junction
+            # The junction itself is non-linear, so we need to detect the transition point
+            def find_linearity_start_from_junction(junction_idx, direction='left'):
+                """
+                Starting from the junction, move outward and detect where linear region begins.
+                
+                Strategy:
+                1. Start with minimum window from junction
+                2. Expand outward while checking linearity quality
+                3. Accept when R² is high AND derivative is stable
+                """
+                if direction == 'left':
+                    # Move leftward from junction
+                    search_end = max(0, junction_idx - max_expansion)
+                    
+                    # Start search further from junction to avoid non-linear region
+                    for linear_start in range(junction_idx - min_plateau_length * 2, search_end - 1, -1):
+                        if linear_start < 0:
+                            break
+                        
+                        # Try window from linear_start to junction
+                        x_window = x_vals[linear_start:junction_idx + 1]
+                        ln_y_window = ln_y[linear_start:junction_idx + 1]
+                        
+                        window_size = len(x_window)
+                        if window_size < min_plateau_length * 2:  # Need longer window for reliable detection
+                            continue
+                        
+                        # Fit and check quality
+                        try:
+                            p = np.polyfit(x_window, ln_y_window, 1)
+                            ln_fit = np.polyval(p, x_window)
+                            r2 = self._calculate_r2(ln_y_window, ln_fit)
+                            
+                            # Check derivative stability using MAD (more robust)
+                            deriv_window = dlnI_dx[linear_start:junction_idx + 1]
+                            deriv_median = np.median(deriv_window)
+                            deriv_mad = np.median(np.abs(deriv_window - deriv_median))
+                            deriv_robust_std = deriv_mad * 1.4826
+                            
+                            # STRICT linearity criteria to avoid junction:
+                            # 1. Very high R² (> 0.98)
+                            # 2. Very stable derivative (MAD-based, tight threshold)
+                            # 3. Residuals must be small near junction
+                            residuals = np.abs(ln_y_window - ln_fit)
+                            max_residual = np.max(residuals[-min_plateau_length:])  # Check last points near junction
+                            
+                            if (r2 > 0.98 and 
+                                deriv_robust_std < 0.15 * np.abs(deriv_median) and
+                                max_residual < 0.05):  # Tight residual tolerance
+                                return linear_start  # Found start of linear region
+                        except Exception:
+                            continue
+                    
+                    return None  # No good linear region found
+                    
+                else:  # direction == 'right'
+                    # Move rightward from junction
+                    search_end = min(len(x_vals), junction_idx + max_expansion)
+                    
+                    # Start search further from junction to avoid non-linear region
+                    for linear_start in range(junction_idx + min_plateau_length * 2, search_end + 1):
+                        if linear_start >= len(x_vals):
+                            break
+                        
+                        # Try window from junction to linear_start
+                        x_window = x_vals[junction_idx:linear_start]
+                        ln_y_window = ln_y[junction_idx:linear_start]
+                        
+                        window_size = len(x_window)
+                        if window_size < min_plateau_length * 2:  # Need longer window
+                            continue
+                        
+                        try:
+                            # Use local coordinates for right side
+                            x_local = x_window - x_window[0]
+                            p = np.polyfit(x_local, ln_y_window, 1)
+                            ln_fit = np.polyval(p, x_local)
+                            r2 = self._calculate_r2(ln_y_window, ln_fit)
+                            
+                            # Check derivative stability using MAD (more robust)
+                            deriv_window = dlnI_dx[junction_idx:linear_start]
+                            deriv_median = np.median(deriv_window)
+                            deriv_mad = np.median(np.abs(deriv_window - deriv_median))
+                            deriv_robust_std = deriv_mad * 1.4826
+                            
+                            # STRICT linearity criteria
+                            residuals = np.abs(ln_y_window - ln_fit)
+                            max_residual = np.max(residuals[:min_plateau_length])  # Check first points near junction
+                            
+                            if (r2 > 0.98 and 
+                                deriv_robust_std < 0.15 * np.abs(deriv_median) and
+                                max_residual < 0.05):
+                                return linear_start  # Found end of linear region
+                        except Exception:
+                            continue
+                    
+                    return None
+            
+            # Try to find precise linear start from junction (if enabled)
+            linear_start_from_junction = None
+            if junction_precision:
+                linear_start_from_junction = find_linearity_start_from_junction(intersection_idx, 'left')
+            
+            if linear_start_from_junction is not None:
+                # Use junction-based detection as starting point
+                orig_end = intersection_idx + 1  # Always end at junction
+                orig_start = linear_start_from_junction
+            # else: keep plateau-based detection (orig_start, orig_end already set)
+            
             # Helper function to fit a region and return R²
             def fit_region_left(start_idx, end_idx):
                 if end_idx - start_idx < min_plateau_length:
@@ -2866,6 +2988,8 @@ class DiffusionLengthExtractor:
                 best_fit_l = None
             else:
                 best_r2_l = best_fit_l['r2']
+                # Store original plateau boundaries before expansion
+                orig_plateau_left = (orig_start, orig_end)
                 
                 # Iteratively expand both boundaries
                 drops_start = 0
@@ -2940,7 +3064,8 @@ class DiffusionLengthExtractor:
                         'intercept': intercept_log,
                         'inv_lambda': inv_lambda,
                         'r2': best_r2_l,
-                        'plateau_indices': (best_fit_l['start'], best_fit_l['end'])
+                        'plateau_indices': (best_fit_l['start'], best_fit_l['end']),
+                        'plateau_original': orig_plateau_left  # Store original plateau before expansion
                     }
                     results.append(best_fit_l)
         
@@ -2966,6 +3091,17 @@ class DiffusionLengthExtractor:
             # Map to original indices
             orig_start = intersection_idx + plat_start_r
             orig_end = intersection_idx + plat_end_r
+            
+            # Try to find precise linear start from junction (if enabled)
+            linear_end_from_junction = None
+            if junction_precision:
+                linear_end_from_junction = find_linearity_start_from_junction(intersection_idx, 'right')
+            
+            if linear_end_from_junction is not None:
+                # Use junction-based detection as starting point
+                orig_start = intersection_idx  # Always start at junction
+                orig_end = linear_end_from_junction
+            # else: keep plateau-based detection (orig_start, orig_end already set)
             
             # Helper function to fit a region and return R²
             def fit_region_right(start_idx, end_idx):
@@ -2998,6 +3134,8 @@ class DiffusionLengthExtractor:
                 best_fit_r = None
             else:
                 best_r2_r = best_fit_r['r2']
+                # Store original plateau boundaries before expansion
+                orig_plateau_right = (orig_start + intersection_idx, orig_end + intersection_idx)
                 
                 # Iteratively expand both boundaries
                 drops_start = 0
@@ -3072,7 +3210,8 @@ class DiffusionLengthExtractor:
                         'intercept': intercept_log,
                         'inv_lambda': inv_lambda,
                         'r2': best_r2_r,
-                        'plateau_indices': (best_fit_r['start'], best_fit_r['end'])
+                        'plateau_indices': (best_fit_r['start'], best_fit_r['end']),
+                        'plateau_original': orig_plateau_right  # Store original plateau before expansion
                     }
                     results.append(best_fit_r)
         
@@ -3128,7 +3267,7 @@ class DiffusionLengthExtractor:
     def fit_all_profiles_linear(self, use_plateau_detection=True, use_shifting=False,
                                  gradient_window=9, min_plateau_length=5,
                                  derivative_threshold=0.3, absolute_threshold=0.03,
-                                 max_expansion=30, consecutive_drops=3):
+                                 max_expansion=30, consecutive_drops=3, junction_precision=True):
         """
         Run linear-on-log fitting for all loaded profiles and populate self.results
         similarly to fit_all_profiles.
@@ -3153,6 +3292,9 @@ class DiffusionLengthExtractor:
             Maximum number of pixels to expand beyond initial plateau (default: 30)
         consecutive_drops : int
             Number of consecutive R² decreases before stopping expansion (default: 3)
+        junction_precision : bool
+            If True, start from junction and detect where linearity begins with strict criteria
+            (R² > 0.95, stable derivative). Avoids including non-linear depletion region. (default: True)
         """
         self.results = []
         self.inv_lambdas = []
@@ -3182,7 +3324,8 @@ class DiffusionLengthExtractor:
                     derivative_threshold=derivative_threshold,
                     absolute_threshold=absolute_threshold,
                     max_expansion=max_expansion,
-                    consecutive_drops=consecutive_drops
+                    consecutive_drops=consecutive_drops,
+                    junction_precision=junction_precision
                 )
             elif use_plateau_detection:
                 # NEW: Use derivative plateau detection only

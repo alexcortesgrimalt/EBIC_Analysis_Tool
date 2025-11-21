@@ -444,12 +444,13 @@ def fit_perpendicular_profiles_linear(viewer):
     extractor.fit_all_profiles_linear(
         use_plateau_detection=True,   # Use derivative plateau method
         use_shifting=True,             # Enable iterative expansion
-        gradient_window=11,             # Window size for derivative
+        gradient_window=7,             # Window size for derivative
         min_plateau_length=5,         # Minimum plateau size
-        derivative_threshold=0.22,      # Max relative variation in derivative
+        derivative_threshold=0.15,      # Max relative variation in derivative
         absolute_threshold=0.03,       # Max absolute variation (1/µm)
         max_expansion=1000,              # Max pixels to expand beyond plateau
-        consecutive_drops=30            # Stop after 10 consecutive R² drops
+        consecutive_drops=50,           # Stop after 30 consecutive R² drops
+        junction_precision=False        # Start from junction to detect linearity onset precisely
     )
 
     summaries = []

@@ -1618,6 +1618,12 @@ class SEMViewer:
             except Exception:
                 self.perpendicular_profiles = []
 
+            # Plot and save perpendicular profiles for all datasets
+            try:
+                self._plot_and_save_sweep_perpendiculars(perp_list, detected_list)
+            except Exception as e:
+                print(f"Failed to plot/save perpendiculars: {e}")
+
             # print("Sweep detection finished.")
             # Optionally open debug view automatically if enabled
             try:
@@ -1627,6 +1633,142 @@ class SEMViewer:
                 pass
         except Exception as e:
             print(f"Failed to run sweep detection: {e}")
+    
+    def _plot_and_save_sweep_perpendiculars(self, perp_list, detected_list):
+        """
+        Plot perpendiculars on the active image and save profiles to perpendicular_plots/folder.
+        Folder naming follows the same logic as depletion_plots.
+        """
+        import os
+        from .perpendicular import plot_perpendicular_profiles
+        
+        # Get common folder name
+        common_name = self._get_sweep_common_name()
+        
+        # Create output directory
+        out_dir = os.path.join(os.getcwd(), 'perpendicular_plots', common_name)
+        os.makedirs(out_dir, exist_ok=True)
+        
+        print(f"Saving perpendicular profiles to: {out_dir}")
+        
+        # Plot perpendiculars on current image if we have them
+        cur_idx = int(self.sweep_index) if self.sweep_index is not None else 0
+        if 0 <= cur_idx < len(perp_list) and perp_list[cur_idx] is not None:
+            profiles = perp_list[cur_idx]
+            if profiles:
+                # Plot on active image
+                try:
+                    if hasattr(self, 'ax') and hasattr(self, 'fig') and self.ax is not None:
+                        plot_perpendicular_profiles(profiles, ax=self.ax, fig=self.fig, debug=False)
+                except Exception as e:
+                    print(f"Failed to plot perpendiculars on image: {e}")
+        
+        # Save all perpendicular profiles to files
+        for i, profiles in enumerate(perp_list):
+            if profiles is None or not profiles:
+                continue
+            
+            # Get dataset name for this index
+            ds_name = "unknown"
+            if hasattr(self, 'sweep_datasets') and i < len(self.sweep_datasets):
+                ds = self.sweep_datasets[i]
+                ds_name = ds.get('sample_name', f'dataset_{i}')
+            
+            # Save individual profile plots
+            try:
+                import matplotlib.pyplot as plt
+                for prof in profiles:
+                    prof_id = prof.get('id', 0)
+                    dist_um = prof["dist_um"]
+                    sem_vals = prof["sem"]
+                    cur_vals = prof["current"]
+                    
+                    # Normalize SEM
+                    sem_vals_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals)+1e-12)
+                    
+                    # Create plot
+                    fig_prof, (ax1, ax_log) = plt.subplots(2, 1, sharex=True, figsize=(8, 6))
+                    
+                    # Top: SEM + Current
+                    ax1.plot(dist_um, sem_vals_norm, color='tab:blue', linewidth=2, label='SEM (norm)')
+                    ax1b = ax1.twinx()
+                    cur = np.array(cur_vals)
+                    ax1b.plot(dist_um, cur, color='tab:red', linewidth=1.2, label='Current (nA)')
+                    
+                    # Bottom: Log current
+                    pos = cur[cur > 0]
+                    floor = max(np.min(pos) * 0.1, 1e-12) if pos.size > 0 else 1e-12
+                    cur_safe = np.maximum(cur, floor)
+                    ax_log.plot(dist_um, cur_safe, color='tab:orange', linewidth=1.5)
+                    ax_log.set_yscale('log')
+                    
+                    # Mark intersection
+                    if prof.get("intersection_idx") is not None:
+                        idx = prof["intersection_idx"]
+                        ax1.scatter(dist_um[idx], sem_vals_norm[idx], color='lime', s=50, marker='x', zorder=10)
+                        ax1b.scatter(dist_um[idx], cur[idx], color='lime', s=50, marker='x', zorder=10)
+                        ax_log.scatter(dist_um[idx], cur_safe[idx], color='lime', s=50, marker='x', zorder=10)
+                    
+                    # Labels
+                    ax1.set_title(f"{ds_name} - Perpendicular {prof_id+1}")
+                    ax1.set_ylabel("SEM Contrast (norm)", color='tab:blue')
+                    ax1b.set_ylabel("Current (nA)", color='tab:red')
+                    ax_log.set_xlabel("Distance (µm)")
+                    ax_log.set_ylabel("Current (nA) [log]", color='tab:orange')
+                    
+                    # Legend
+                    lines1, labels1 = ax1.get_legend_handles_labels()
+                    lines2, labels2 = ax1b.get_legend_handles_labels()
+                    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+                    
+                    plt.tight_layout()
+                    
+                    # Save plot
+                    filename = f"{ds_name}_profile_{prof_id+1:02d}.png"
+                    filepath = os.path.join(out_dir, filename)
+                    fig_prof.savefig(filepath, dpi=150, bbox_inches='tight')
+                    plt.close(fig_prof)
+                    
+                    # Save CSV with profile data
+                    csv_filename = f"{ds_name}_profile_{prof_id+1:02d}.csv"
+                    csv_filepath = os.path.join(out_dir, csv_filename)
+                    import pandas as pd
+                    
+                    # Prepare data for CSV
+                    intersection_idx = prof.get("intersection_idx")
+                    csv_data = {
+                        'distance_um': dist_um,
+                        'sem_raw': sem_vals,
+                        'sem_normalized': sem_vals_norm,
+                        'current_nA': cur_vals,
+                        'current_log_safe': cur_safe,
+                        'is_junction': ['Yes' if j == intersection_idx else 'No' for j in range(len(dist_um))]
+                    }
+                    
+                    df = pd.DataFrame(csv_data)
+                    df.to_csv(csv_filepath, index=False)
+                
+            except Exception as e:
+                print(f"Failed to save profiles for dataset {i}: {e}")
+        
+        print(f"Saved perpendicular profiles for {len([p for p in perp_list if p])} datasets")
+    
+    def _get_sweep_common_name(self):
+        """Extract common folder name from sweep datasets."""
+        if hasattr(self, 'sweep_datasets') and self.sweep_datasets:
+            names = [ds.get('sample_name', '') for ds in self.sweep_datasets if ds.get('sample_name')]
+            if not names:
+                return self.sample_name if hasattr(self, 'sample_name') else 'unknown'
+            if len(names) == 1:
+                return names[0]
+            # Find common prefix
+            import os
+            common = os.path.commonprefix(names)
+            common = common.rstrip('_-')
+            if len(common) < 3:
+                return names[0]
+            return common
+        return self.sample_name if hasattr(self, 'sample_name') else 'unknown'
     
     def _debug_show_sweep(self, event=None):
         """Open a figure showing each sweep dataset image with detected junction and perpendiculars (if available)."""
