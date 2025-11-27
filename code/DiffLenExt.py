@@ -719,10 +719,8 @@ class DiffusionLengthExtractor:
             "left_start": left_start,
             "right_start": right_start,
             "depletion_width": depletion_width,
-            # include chosen fits so callers can visualize the selected fit curves
             "best_left_fit": best_left,
             "best_right_fit": best_right,
-            # Include original plateau boundaries before expansion
             "left_plateau_original": best_left.get('plateau_original') if best_left else None,
             "right_plateau_original": best_right.get('plateau_original') if best_right else None,
         }
@@ -794,17 +792,87 @@ class DiffusionLengthExtractor:
             # Shade depletion region if both edges present
             if left_start is not None and right_start is not None:
                 # shift edges to peak-centered plotting coords
-                ax.axvspan(left_start - ref, right_start - ref, color='green', alpha=0.12, label='Depletion zone')
+                ax.axvspan(left_start - ref, right_start - ref, color='green', alpha=0.10, zorder=1, label='Depletion zone')
 
-            # Draw vertical lines
-            if left_start is not None:
-                ax.axvline(left_start - ref, color='b', linestyle='--', label="Left Start")
-            if right_start is not None:
-                ax.axvline(right_start - ref, color='r', linestyle='--', label="Right Start")
-
-            # Overlay best-fit curves if available
+            # Overlay best-fit curves and color-code plateau regions
             best_left = depletion.get('best_left_fit', None)
             best_right = depletion.get('best_right_fit', None)
+            
+            # Color-code LEFT plateau regions: initial plateau vs expansion
+            if best_left is not None and 'plateau_indices' in best_left:
+                idx_start, idx_end = best_left['plateau_indices']
+                
+                # Get original plateau boundaries (before expansion)
+                left_plateau_orig = depletion.get('left_plateau_original')
+                
+                if left_plateau_orig is not None and isinstance(left_plateau_orig, (tuple, list)) and len(left_plateau_orig) == 2:
+                    orig_start, orig_end = left_plateau_orig
+                    
+                    # Initial plateau (dark blue) - what was detected first
+                    if orig_start < len(x) and orig_end <= len(x):
+                        plat_x_start = x[orig_start] - ref
+                        plat_x_end = x[orig_end - 1] - ref
+                        ax.axvspan(plat_x_start, plat_x_end, color='darkblue', alpha=0.25, zorder=1, label='Left initial plateau')
+                    
+                    # Expansion regions (light cyan) - what was added by iterative expansion
+                    # Tail expansion (left of original plateau)
+                    if idx_start < orig_start:
+                        exp_x_start = x[idx_start] - ref
+                        exp_x_end = x[orig_start] - ref
+                        ax.axvspan(exp_x_start, exp_x_end, color='cyan', alpha=0.20, zorder=1, label='Left expansion (tail)')
+                    
+                    # Junction expansion (right of original plateau, toward junction)
+                    if idx_end > orig_end and orig_end < len(x):
+                        exp_x_start = x[orig_end - 1] - ref
+                        exp_x_end = x[idx_end - 1] - ref
+                        ax.axvspan(exp_x_start, exp_x_end, color='cyan', alpha=0.20, zorder=1, label='Left expansion (junction)')
+                else:
+                    # Fallback: show entire region if no original plateau info (use_shifting=False)
+                    if idx_start < len(x) and idx_end <= len(x):
+                        plat_x_start = x[idx_start] - ref
+                        plat_x_end = x[idx_end - 1] - ref
+                        ax.axvspan(plat_x_start, plat_x_end, color='blue', alpha=0.15, zorder=1, label='Left plateau region')
+            
+            # Color-code RIGHT plateau regions: initial plateau vs expansion
+            if best_right is not None and 'plateau_indices' in best_right:
+                idx_start, idx_end = best_right['plateau_indices']
+                
+                # Get original plateau boundaries (before expansion)
+                right_plateau_orig = depletion.get('right_plateau_original')
+                
+                if right_plateau_orig is not None and isinstance(right_plateau_orig, (tuple, list)) and len(right_plateau_orig) == 2:
+                    orig_start, orig_end = right_plateau_orig
+                    
+                    # Initial plateau (dark red) - what was detected first
+                    if orig_start < len(x) and orig_end <= len(x):
+                        plat_x_start = x[orig_start] - ref
+                        plat_x_end = x[orig_end - 1] - ref
+                        ax.axvspan(plat_x_start, plat_x_end, color='darkred', alpha=0.25, zorder=1, label='Right initial plateau')
+                    
+                    # Expansion regions (light salmon) - what was added by iterative expansion
+                    # Junction expansion (left of original plateau, toward junction)
+                    if idx_start < orig_start:
+                        exp_x_start = x[idx_start] - ref
+                        exp_x_end = x[orig_start] - ref
+                        ax.axvspan(exp_x_start, exp_x_end, color='salmon', alpha=0.20, zorder=1, label='Right expansion (junction)')
+                    
+                    # Tail expansion (right of original plateau)
+                    if idx_end > orig_end and orig_end < len(x):
+                        exp_x_start = x[orig_end - 1] - ref
+                        exp_x_end = x[idx_end - 1] - ref
+                        ax.axvspan(exp_x_start, exp_x_end, color='salmon', alpha=0.20, zorder=1, label='Right expansion (tail)')
+                else:
+                    # Fallback: show entire region if no original plateau info (use_shifting=False)
+                    if idx_start < len(x) and idx_end <= len(x):
+                        plat_x_start = x[idx_start] - ref
+                        plat_x_end = x[idx_end - 1] - ref
+                        ax.axvspan(plat_x_start, plat_x_end, color='red', alpha=0.15, zorder=1, label='Right plateau region')
+            
+            # Draw vertical lines for depletion boundaries
+            if left_start is not None:
+                ax.axvline(left_start - ref, color='b', linestyle='--', zorder=2, label="Left depletion edge")
+            if right_start is not None:
+                ax.axvline(right_start - ref, color='r', linestyle='--', zorder=2, label="Right depletion edge")
 
             if best_left is not None:
                 # Prefer global_x_vals if present (already in profile coords).
@@ -851,7 +919,12 @@ class DiffusionLengthExtractor:
                 ax.set_title(f"Profile {profile_id} – Depletion Width = {depletion['depletion_width']:.2f} µm")
             ax.set_xlabel("Distance (µm)")
             ax.set_ylabel("Current (nA)")
-            ax.legend()
+            
+            # Remove duplicate labels from legend
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys(), loc='best', fontsize='small')
+            
             ax.grid(True, linestyle='--', alpha=0.5)
             fig.tight_layout()
             # Ensure a folder to save the per-profile depletion plot so the
@@ -2558,7 +2631,10 @@ class DiffusionLengthExtractor:
         results : list
             List with best_left and best_right fit dicts
         """
-        from .perpendicular import gradient_with_window
+        try:
+            from .perpendicular import gradient_with_window
+        except ImportError:
+            from perpendicular import gradient_with_window
         
         x_vals = np.asarray(x_vals, dtype=float)
         y_vals = np.asarray(y_vals, dtype=float)
@@ -2569,16 +2645,15 @@ class DiffusionLengthExtractor:
         
         results = []
         
-        # Prepare log-transformed data. Use the RAW ln(I) for derivative
-        # computation and plateau detection — do not use any filtered
-        # current for depletion-region detection per user request.
+        # Prepare log-transformed data.
+        # NOTE: y_vals may already be filtered if use_filtered_data=True in parent caller.
+        # This method works on whatever data is passed to it.
         pos = y_vals[y_vals > 0]
         floor = max(np.min(pos) * 0.1, 1e-12) if pos.size > 0 else 1e-12
         y_safe = np.maximum(y_vals, floor)
         ln_y = np.log(y_safe)
 
-        # Compute derivative d(ln(I))/dx using windowed gradient on the
-        # RAW ln(I) (no filtering).
+        # Compute derivative d(ln(I))/dx using windowed gradient.
         try:
             dlnI_dx = gradient_with_window(x_vals, ln_y, window=gradient_window)
         except Exception as e:
@@ -2669,7 +2744,8 @@ class DiffusionLengthExtractor:
                     'intercept': intercept_log,
                     'inv_lambda': inv_lambda,
                     'r2': r2,
-                    'plateau_indices': (orig_start, orig_end)
+                    'plateau_indices': (orig_start, orig_end),
+                    'plateau_original': (orig_start, orig_end)  # Same as plateau_indices when no expansion
                 })
                 # print(f"Profile {profile_id} Left: Detected plateau from index {orig_start} to {orig_end}, "
                 #       f"slope={slope_log:.3g}, R²={r2:.3f}, inv_lambda={inv_lambda:.3g} µm")
@@ -2760,7 +2836,8 @@ class DiffusionLengthExtractor:
                     'intercept': intercept_log,
                     'inv_lambda': inv_lambda,
                     'r2': r2,
-                    'plateau_indices': (orig_start, orig_end)
+                    'plateau_indices': (orig_start, orig_end),
+                    'plateau_original': (orig_start, orig_end)  # Same as plateau_indices when no expansion
                 })
                 # print(f"Profile {profile_id} Right: Detected plateau from index {orig_start} to {orig_end}, "
                 #       f"slope={slope_log:.3g}, R²={r2:.3f}, inv_lambda={inv_lambda:.3g} µm")
@@ -2773,6 +2850,7 @@ class DiffusionLengthExtractor:
                                              gradient_window=3, min_plateau_length=5, 
                                              derivative_threshold=0.4, absolute_threshold=0.1,
                                              max_expansion=500, consecutive_drops=10,
+                                             min_r2_threshold=0.80, use_r2_threshold=True,
                                              junction_precision=True):
         """
         HYBRID METHOD: Combines plateau detection with iterative expansion.
@@ -2796,6 +2874,12 @@ class DiffusionLengthExtractor:
             Maximum number of pixels to expand beyond initial plateau (default: 30)
         consecutive_drops : int
             Number of consecutive R² decreases before stopping expansion (default: 3)
+        min_r2_threshold : float
+            Minimum R² value required to continue expansion (default: 0.80)
+            Stops expansion if R² drops below this threshold (only when use_r2_threshold=True)
+        use_r2_threshold : bool
+            Whether to apply the min_r2_threshold check (default: True)
+            If False, expansion continues as long as consecutive_drops is not reached
         
         Other parameters same as fit_profile_sides_plateau_based
         """
@@ -2813,7 +2897,9 @@ class DiffusionLengthExtractor:
         
         results = []
         
-        # Prepare log-transformed data
+        # Prepare log-transformed data.
+        # NOTE: y_vals may already be filtered if use_filtered_data=True in parent caller.
+        # This method works on whatever data is passed to it.
         pos = y_vals[y_vals > 0]
         floor = max(np.min(pos) * 0.1, 1e-12) if pos.size > 0 else 1e-12
         y_safe = np.maximum(y_vals, floor)
@@ -3004,15 +3090,21 @@ class DiffusionLengthExtractor:
                     candidate = fit_region_left(new_start, best_fit_l['end'])
                     if candidate is None:
                         drops_start += 1
-                    elif candidate['r2'] > best_r2_l:
-                        # Improvement! Update best fit and reset counter
+                    elif candidate['r2'] >= best_r2_l:
+                        # R² improved - always accept and reset counter
                         best_fit_l = candidate
                         best_r2_l = candidate['r2']
                         drops_start = 0
+                    elif not use_r2_threshold or candidate['r2'] >= min_r2_threshold:
+                        # R² decreased but either threshold disabled or still above threshold - accept
+                        best_fit_l = candidate
+                        best_r2_l = candidate['r2']
+                        drops_start += 1
                     else:
-                        # R² decreased
+                        # R² decreased and below threshold - reject
                         drops_start += 1
                     
+                    # Stop if too many consecutive drops
                     if drops_start >= consecutive_drops:
                         break
                 
@@ -3025,15 +3117,21 @@ class DiffusionLengthExtractor:
                     candidate = fit_region_left(best_fit_l['start'], new_end)
                     if candidate is None:
                         drops_end += 1
-                    elif candidate['r2'] > best_r2_l:
-                        # Improvement! Update best fit and reset counter
+                    elif candidate['r2'] >= best_r2_l:
+                        # R² improved - always accept and reset counter
                         best_fit_l = candidate
                         best_r2_l = candidate['r2']
                         drops_end = 0
+                    elif not use_r2_threshold or candidate['r2'] >= min_r2_threshold:
+                        # R² decreased but either threshold disabled or still above threshold - accept
+                        best_fit_l = candidate
+                        best_r2_l = candidate['r2']
+                        drops_end += 1
                     else:
-                        # R² decreased
+                        # R² decreased and below threshold - reject
                         drops_end += 1
                     
+                    # Stop if too many consecutive drops
                     if drops_end >= consecutive_drops:
                         break
                 
@@ -3150,15 +3248,21 @@ class DiffusionLengthExtractor:
                     candidate = fit_region_right(new_start, best_fit_r['end'])
                     if candidate is None:
                         drops_start += 1
-                    elif candidate['r2'] > best_r2_r:
-                        # Improvement! Update best fit and reset counter
+                    elif candidate['r2'] >= best_r2_r:
+                        # R² improved - always accept and reset counter
                         best_fit_r = candidate
                         best_r2_r = candidate['r2']
                         drops_start = 0
+                    elif not use_r2_threshold or candidate['r2'] >= min_r2_threshold:
+                        # R² decreased but either threshold disabled or still above threshold - accept
+                        best_fit_r = candidate
+                        best_r2_r = candidate['r2']
+                        drops_start += 1
                     else:
-                        # R² decreased
+                        # R² decreased and below threshold - reject
                         drops_start += 1
                     
+                    # Stop if too many consecutive drops
                     if drops_start >= consecutive_drops:
                         break
                 
@@ -3171,15 +3275,21 @@ class DiffusionLengthExtractor:
                     candidate = fit_region_right(best_fit_r['start'], new_end)
                     if candidate is None:
                         drops_end += 1
-                    elif candidate['r2'] > best_r2_r:
-                        # Improvement! Update best fit and reset counter
+                    elif candidate['r2'] >= best_r2_r:
+                        # R² improved - always accept and reset counter
                         best_fit_r = candidate
                         best_r2_r = candidate['r2']
                         drops_end = 0
+                    elif not use_r2_threshold or candidate['r2'] >= min_r2_threshold:
+                        # R² decreased but either threshold disabled or still above threshold - accept
+                        best_fit_r = candidate
+                        best_r2_r = candidate['r2']
+                        drops_end += 1
                     else:
-                        # R² decreased
+                        # R² decreased and below threshold - reject
                         drops_end += 1
                     
+                    # Stop if too many consecutive drops
                     if drops_end >= consecutive_drops:
                         break
                 
@@ -3267,7 +3377,9 @@ class DiffusionLengthExtractor:
     def fit_all_profiles_linear(self, use_plateau_detection=True, use_shifting=False,
                                  gradient_window=9, min_plateau_length=5,
                                  derivative_threshold=0.3, absolute_threshold=0.03,
-                                 max_expansion=30, consecutive_drops=3, junction_precision=True):
+                                 max_expansion=30, consecutive_drops=3, min_r2_threshold=0.80,
+                                 use_r2_threshold=True, junction_precision=True,
+                                 use_filtered_data=False, filter_cutoff=0.0):
         """
         Run linear-on-log fitting for all loaded profiles and populate self.results
         similarly to fit_all_profiles.
@@ -3292,9 +3404,19 @@ class DiffusionLengthExtractor:
             Maximum number of pixels to expand beyond initial plateau (default: 30)
         consecutive_drops : int
             Number of consecutive R² decreases before stopping expansion (default: 3)
+        min_r2_threshold : float
+            Minimum R² value required to continue expansion (default: 0.80)
+            Stops expansion if R² drops below this threshold (only when use_r2_threshold=True)
+        use_r2_threshold : bool
+            Whether to apply the min_r2_threshold check (default: True)
+            If False, expansion continues as long as consecutive_drops is not reached
         junction_precision : bool
             If True, start from junction and detect where linearity begins with strict criteria
             (R² > 0.95, stable derivative). Avoids including non-linear depletion region. (default: True)
+        use_filtered_data : bool
+            If True, apply low-pass filter to current data before fitting (default: False)
+        filter_cutoff : float
+            Cutoff fraction for low-pass filter (default: 0.1 = 10% of Nyquist frequency)
         """
         self.results = []
         self.inv_lambdas = []
@@ -3305,13 +3427,19 @@ class DiffusionLengthExtractor:
             'gradient_window': gradient_window,
             'min_plateau_length': min_plateau_length,
             'derivative_threshold': derivative_threshold,
-            'absolute_threshold': absolute_threshold
+            'absolute_threshold': absolute_threshold,
+            'use_filtered_data': use_filtered_data,
+            'filter_cutoff': filter_cutoff
         }
 
         for i, prof in enumerate(self.profiles):
             intersection_idx = prof.get('intersection_idx', None)
             x_vals = np.array(prof['dist_um'])
             y_vals = np.array(prof['current'])
+            
+            # Apply filtering if requested
+            if use_filtered_data:
+                y_vals = self.apply_low_pass_filter(y_vals, cutoff_fraction=filter_cutoff, visualize=False)
 
             if use_plateau_detection and use_shifting:
                 # HYBRID: Use plateau detection + iterative expansion for refinement
@@ -3325,6 +3453,8 @@ class DiffusionLengthExtractor:
                     absolute_threshold=absolute_threshold,
                     max_expansion=max_expansion,
                     consecutive_drops=consecutive_drops,
+                    min_r2_threshold=min_r2_threshold,
+                    use_r2_threshold=use_r2_threshold,
                     junction_precision=junction_precision
                 )
             elif use_plateau_detection:
@@ -3355,3 +3485,4 @@ class DiffusionLengthExtractor:
                 'fit_sides': sides,
                 'depletion': depletion_info
             })
+

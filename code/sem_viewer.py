@@ -1726,12 +1726,14 @@ class SEMViewer:
                     # Save plot
                     filename = f"{ds_name}_profile_{prof_id+1:02d}.png"
                     filepath = os.path.join(out_dir, filename)
+                    print(f"  Saving plot: {filepath}")
                     fig_prof.savefig(filepath, dpi=150, bbox_inches='tight')
                     plt.close(fig_prof)
                     
                     # Save CSV with profile data
                     csv_filename = f"{ds_name}_profile_{prof_id+1:02d}.csv"
                     csv_filepath = os.path.join(out_dir, csv_filename)
+                    print(f"  Saving CSV: {csv_filepath}")
                     import pandas as pd
                     
                     # Prepare data for CSV
@@ -1749,7 +1751,9 @@ class SEMViewer:
                     df.to_csv(csv_filepath, index=False)
                 
             except Exception as e:
+                import traceback
                 print(f"Failed to save profiles for dataset {i}: {e}")
+                traceback.print_exc()
         
         print(f"Saved perpendicular profiles for {len([p for p in perp_list if p])} datasets")
     

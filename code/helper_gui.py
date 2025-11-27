@@ -609,7 +609,17 @@ def fit_perpendicular_profiles_linear(viewer):
             except Exception:
                 dln_meas = np.zeros_like(x_plot)
 
-            ax_der.plot(x_plot, dln_meas, color='tab:gray', linestyle=':', label='dlnI/dx (meas)')
+            ax_der.plot(x_plot, dln_meas, color='tab:gray', linestyle=':', label='dlnI/dx (raw)', alpha=0.6)
+
+            # Compute and plot derivative of filtered signal
+            if ln_y_filtered is not None:
+                try:
+                    if x_vals_plot.size > 1:
+                        dln_filtered = gradient_with_window(x_vals_plot, ln_y_filtered, window=gradient_window)
+                        ax_der.plot(x_plot, dln_filtered, color='tab:orange', linestyle='-', lw=1.5, 
+                                   label='dlnI/dx (filtered)', alpha=0.9)
+                except Exception as e:
+                    print(f"Warning: Could not compute filtered derivative: {e}")
 
             # Overlay fit-derived dlnI/dx when available (from best_left/best_right)
             try:
