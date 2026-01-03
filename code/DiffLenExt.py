@@ -227,7 +227,13 @@ class DiffusionLengthExtractor:
             search_range = range(0, n - min_plateau_length + 1)
         
         for start in search_range:
-            for length in range(min_plateau_length, min(n - start + 1, 50)):  # max 50 points
+            # Limit plateau search to 1.5x the minimum plateau length
+            # This focuses detection on compact, well-defined plateaus
+            max_length_to_try = int(1.5 * min_plateau_length) + 1
+            # Cap at actual data length available
+            max_length_to_try = min(max_length_to_try, n - start + 1)
+            
+            for length in range(min_plateau_length, max_length_to_try):
                 end = start + length
                 segment = deriv_smooth[start:end]
                 
@@ -249,9 +255,9 @@ class DiffusionLengthExtractor:
                     local_threshold_rel = derivative_threshold * np.abs(segment_median) if segment_median != 0 else absolute_threshold
                     local_threshold = max(local_threshold_rel, absolute_threshold)
                     
-                    # Plateau criteria using robust statistics
-                    is_plateau = (segment_robust_std < local_threshold * 0.7 and 
-                                 segment_iqr < local_threshold * 1.2)
+                    # Plateau criteria using robust statistics (relaxed for noisy data)
+                    is_plateau = (segment_robust_std < local_threshold * 0.8 and 
+                                 segment_iqr < local_threshold * 1.5)
                 else:
                     # OLD METHOD: Use mean, std, and range (sensitive to outliers)
                     segment_mean = np.mean(segment)
@@ -271,7 +277,7 @@ class DiffusionLengthExtractor:
                         best_plateau_end = end
                         best_plateau_length = length
                         best_plateau_std = segment_robust_std if use_robust else segment_std
-                    elif start < best_plateau_start and length >= min_plateau_length:
+                    elif start < best_plateau_start and length > best_plateau_length:
                         # Found a plateau closer to zero with acceptable length
                         best_plateau_start = start
                         best_plateau_end = end
@@ -284,120 +290,6 @@ class DiffusionLengthExtractor:
             return best_plateau_start, best_plateau_end, plateau_mean_deriv
         
         return None, None, None
-
-    # def fit_profile_sides(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
-        #                   plot_left=True, plot_right=True):
-        # """
-        # Fit falling exponentials on both sides:
-        # 1. Find the correct starting point by shifting until 1/λ stabilizes.
-        # 2. With the starting point fixed, progressively truncate the tail
-        #    and fit each case.
-        # 3. Visualize only the tail truncation results.
-        # """
-        # x_vals = np.asarray(x_vals)
-        # y_vals = np.asarray(y_vals)
-
-        # base_idx = int(np.argmax(y_vals))
-        # if intersection_idx is None:
-        #     intersection_idx = base_idx
-
-        # results = []
-        # tolerance = self.pixel_size * 1e6
-
-        # # --- LEFT side: find start index ---
-        # prev_left_val, left_stable, best_left_idx = None, False, None
-        # for shift in range(0, -16, -1):  # try shifts leftwards
-        #     if left_stable:
-        #         break
-        #     start_idx_left = max(0, (intersection_idx if intersection_idx <= base_idx else base_idx) + shift)
-        #     left_x_raw = x_vals[:start_idx_left + 1]
-        #     y_left_raw = y_vals[:start_idx_left + 1]
-
-        #     y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-        #     y_left_flipped = y_left_filtered[::-1]
-        #     x_left_flipped = np.abs(left_x_raw)[::-1]
-
-        #     cut_idx = self._find_snr_end_index(y_left_flipped)
-        #     left_y_truncated = y_left_flipped[:cut_idx]
-        #     left_x_truncated = x_left_flipped[:cut_idx]
-
-        #     if len(left_x_truncated) > 2:
-        #         left_fit = self._fit_falling(
-        #             x=left_x_truncated, y=left_y_truncated,
-        #             shift=shift, side="Left", profile_id=profile_id
-        #         )
-        #         if left_fit:
-        #             curr_val = left_fit.get('inv_lambda', None)
-        #             if curr_val is not None:
-        #                 if prev_left_val is not None and abs(curr_val - prev_left_val) <= tolerance:
-        #                     left_stable, best_left_idx = True, start_idx_left
-        #                 prev_left_val = curr_val
-
-        # # --- RIGHT side: find start index ---
-        # prev_right_val, right_stable, best_right_idx = None, False, None
-        # for shift in range(0, 16):  # try shifts rightwards
-        #     if right_stable:
-        #         break
-        #     start_idx_right = min(len(x_vals) - 1,
-        #                           (intersection_idx if intersection_idx >= base_idx else base_idx) + shift)
-        #     right_x_raw = x_vals[start_idx_right:]
-        #     y_right_raw = y_vals[start_idx_right:]
-
-        #     y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
-        #     cut_idx = self._find_snr_end_index(y_right_filtered)
-        #     right_y_truncated = y_right_filtered[:cut_idx]
-        #     right_x_truncated = right_x_raw[:cut_idx]
-
-        #     if len(right_x_truncated) > 2:
-        #         right_fit = self._fit_falling(
-        #             x=right_x_truncated, y=right_y_truncated,
-        #             shift=shift, side="Right", profile_id=profile_id
-        #         )
-        #         if right_fit:
-        #             curr_val = right_fit.get('inv_lambda', None)
-        #             if curr_val is not None:
-        #                 if prev_right_val is not None and abs(curr_val - prev_right_val) <= tolerance:
-        #                     right_stable, best_right_idx = True, start_idx_right
-        #                 prev_right_val = curr_val
-
-        # # --- Tail truncations with fixed start indices ---
-        # if best_left_idx is not None:
-        #     left_x_raw = x_vals[:best_left_idx + 1]
-        #     y_left_raw = y_vals[:best_left_idx + 1]
-        #     y_left_filtered = self.apply_low_pass_filter(y_left_raw, visualize=False)
-        #     y_left_flipped = y_left_filtered[::-1]
-        #     x_left_flipped = np.abs(left_x_raw)[::-1]
-
-        #     cut_idx = self._find_snr_end_index(y_left_flipped)
-        #     left_y_truncated = y_left_flipped[:cut_idx]
-        #     left_x_truncated = x_left_flipped[:cut_idx]
-
-        #     results.extend(self._truncate_tail_and_fit(
-        #         left_x_truncated, left_y_truncated,
-        #         shift=0, side="Left", profile_id=profile_id
-        #     ))
-
-        # if best_right_idx is not None:
-        #     right_x_raw = x_vals[best_right_idx:]
-        #     y_right_raw = y_vals[best_right_idx:]
-        #     y_right_filtered = self.apply_low_pass_filter(y_right_raw, visualize=False)
-
-        #     cut_idx = self._find_snr_end_index(y_right_filtered)
-        #     right_y_truncated = y_right_filtered[:cut_idx]
-        #     right_x_truncated = right_x_raw[:cut_idx]
-
-        #     results.extend(self._truncate_tail_and_fit(
-        #         right_x_truncated, right_y_truncated,
-        #         shift=0, side="Right", profile_id=profile_id
-        #     ))
-
-        # # --- Visualization: only tail truncations ---
-        # if plot_left and best_left_idx is not None:
-        #     self._plot_tailcut_fits(results, x_vals, y_vals, 'Left', base_idx, profile_id)
-        # if plot_right and best_right_idx is not None:
-        #     self._plot_tailcut_fits(results, x_vals, y_vals, 'Right', base_idx, profile_id)
-
-        # return results
     
     def fit_profile_sides(self, x_vals, y_vals, intersection_idx=None, profile_id=0,
                           plot_left=False, plot_right=False, prevent_cross_peak=False):
@@ -2851,7 +2743,8 @@ class DiffusionLengthExtractor:
                                              derivative_threshold=0.4, absolute_threshold=0.1,
                                              max_expansion=500, consecutive_drops=10,
                                              min_r2_threshold=0.80, use_r2_threshold=True,
-                                             junction_precision=True):
+                                             junction_precision=True, use_full_right_profile=False,
+                                             left_params=None, right_params=None):
         """
         HYBRID METHOD: Combines plateau detection with iterative expansion.
         
@@ -2880,6 +2773,12 @@ class DiffusionLengthExtractor:
         use_r2_threshold : bool
             Whether to apply the min_r2_threshold check (default: True)
             If False, expansion continues as long as consecutive_drops is not reached
+        left_params : dict, optional
+            Override parameters for left side fitting. Keys: 'gradient_window', 'min_plateau_length',
+            'derivative_threshold', 'absolute_threshold', 'max_expansion', 'consecutive_drops',
+            'min_r2_threshold', 'use_r2_threshold'
+        right_params : dict, optional
+            Override parameters for right side fitting. Same keys as left_params
         
         Other parameters same as fit_profile_sides_plateau_based
         """
@@ -2905,13 +2804,44 @@ class DiffusionLengthExtractor:
         y_safe = np.maximum(y_vals, floor)
         ln_y = np.log(y_safe)
 
-        # Compute derivative
+        # Set up side-specific parameters
+        left_p = {
+            'gradient_window': gradient_window,
+            'min_plateau_length': min_plateau_length,
+            'derivative_threshold': derivative_threshold,
+            'absolute_threshold': absolute_threshold,
+            'max_expansion': max_expansion,
+            'consecutive_drops': consecutive_drops,
+            'min_r2_threshold': min_r2_threshold,
+            'use_r2_threshold': use_r2_threshold,
+            'use_full_right_profile': use_full_right_profile,
+            'search_from_end': False  # Search from junction outward by default
+        }
+        if left_params:
+            left_p.update(left_params)
+        
+        right_p = {
+            'gradient_window': gradient_window,
+            'min_plateau_length': min_plateau_length,
+            'derivative_threshold': derivative_threshold,
+            'absolute_threshold': absolute_threshold,
+            'max_expansion': max_expansion,
+            'consecutive_drops': consecutive_drops,
+            'min_r2_threshold': min_r2_threshold,
+            'use_r2_threshold': use_r2_threshold,
+            'use_full_right_profile': use_full_right_profile,
+            'search_from_end': False  # Search from junction outward by default
+        }
+        if right_params:
+            right_p.update(right_params)
+
+        # Compute derivative d(ln(I))/dx using windowed gradient.
         try:
             dlnI_dx = gradient_with_window(x_vals, ln_y, window=gradient_window)
         except Exception as e:
-            print(f"Profile {profile_id}: Failed to compute gradient: {e}")
+            print(f"Profile {profile_id}: Failed to compute gradient on raw ln: {e}")
             return results
-        
+
         # --- LEFT SIDE: Detect initial plateau ---
         left_x = x_vals[:intersection_idx + 1]
         left_ln_y = ln_y[:intersection_idx + 1]
@@ -2923,10 +2853,10 @@ class DiffusionLengthExtractor:
         
         plat_start_l, plat_end_l, mean_deriv_l = self._detect_plateau_in_derivative(
             left_x_flip, left_deriv_flip, 
-            min_plateau_length=min_plateau_length,
-            derivative_threshold=derivative_threshold,
-            absolute_threshold=absolute_threshold,
-            search_from_end=False
+            min_plateau_length=left_p['min_plateau_length'],
+            derivative_threshold=left_p['derivative_threshold'],
+            absolute_threshold=left_p['absolute_threshold'],
+            search_from_end=left_p.get('search_from_end', False)  # Default False for left (already flipped)
         )
         
         if plat_start_l is not None and plat_end_l is not None:
@@ -3046,7 +2976,7 @@ class DiffusionLengthExtractor:
             
             # Helper function to fit a region and return R²
             def fit_region_left(start_idx, end_idx):
-                if end_idx - start_idx < min_plateau_length:
+                if end_idx - start_idx < left_p['min_plateau_length']:
                     return None
                 x_test = x_vals[start_idx:end_idx]
                 ln_y_test = ln_y[start_idx:end_idx]
@@ -3059,12 +2989,26 @@ class DiffusionLengthExtractor:
                     return None
                 
                 try:
-                    p = np.polyfit(x_test, ln_y_test, 1)
-                    ln_fit = np.polyval(p, x_test)
-                    r2 = self._calculate_r2(ln_y_test, ln_fit)
+                    # For left side: flip x so distance increases moving away from junction
+                    # This makes the natural slope positive for exponential decay
+                    x_flipped = x_test[::-1] - x_test[-1]  # Start from 0 at junction end
+                    x_flipped = -x_flipped  # Make positive distances
+                    ln_y_flipped = ln_y_test[::-1]
+                    
+                    p = np.polyfit(x_flipped, ln_y_flipped, 1)
+                    ln_fit_flipped = np.polyval(p, x_flipped)
+                    r2 = self._calculate_r2(ln_y_flipped, ln_fit_flipped)
+                    
+                    # Slope should now be naturally negative (decay), we take abs and make positive
+                    slope = abs(float(p[0]))
+                    
+                    # Store both flipped fit (for slope calculation) and original order (for plotting)
+                    ln_fit = ln_fit_flipped[::-1]  # Flip back to original order
+                    
                     return {'start': start_idx, 'end': end_idx, 'r2': r2, 
                             'x': x_test, 'ln_y': ln_y_test, 'y': y_test,
-                            'slope': float(p[0]), 'intercept': float(p[1]), 'ln_fit': ln_fit}
+                            'slope': slope, 'intercept': float(p[1]), 'ln_fit': ln_fit,
+                            'x_flipped': x_flipped, 'ln_y_flipped': ln_y_flipped}
                 except Exception:
                     return None
             
@@ -3082,7 +3026,7 @@ class DiffusionLengthExtractor:
                 drops_end = 0
                 
                 # Expand toward tail (decrease start_idx) while R² improves
-                for expansion in range(1, max_expansion + 1):
+                for expansion in range(1, left_p['max_expansion'] + 1):
                     new_start = max(0, orig_start - expansion)
                     if new_start == best_fit_l['start']:  # Can't expand further
                         break
@@ -3095,21 +3039,26 @@ class DiffusionLengthExtractor:
                         best_fit_l = candidate
                         best_r2_l = candidate['r2']
                         drops_start = 0
-                    elif not use_r2_threshold or candidate['r2'] >= min_r2_threshold:
-                        # R² decreased but either threshold disabled or still above threshold - accept
+                    elif not left_p['use_r2_threshold']:
+                        # Threshold disabled - accept any valid candidate
+                        best_fit_l = candidate
+                        best_r2_l = candidate['r2']
+                        drops_start += 1
+                    elif candidate['r2'] >= left_p['min_r2_threshold']:
+                        # R² decreased but still above threshold - accept
                         best_fit_l = candidate
                         best_r2_l = candidate['r2']
                         drops_start += 1
                     else:
-                        # R² decreased and below threshold - reject
+                        # R² below threshold - reject but count as drop
                         drops_start += 1
                     
                     # Stop if too many consecutive drops
-                    if drops_start >= consecutive_drops:
+                    if drops_start >= left_p['consecutive_drops']:
                         break
                 
                 # Expand toward junction (increase end_idx) while R² improves
-                for expansion in range(1, max_expansion + 1):
+                for expansion in range(1, left_p['max_expansion'] + 1):
                     new_end = min(intersection_idx + 1, best_fit_l['end'] + expansion)
                     if new_end == best_fit_l['end']:  # Can't expand further
                         break
@@ -3122,18 +3071,100 @@ class DiffusionLengthExtractor:
                         best_fit_l = candidate
                         best_r2_l = candidate['r2']
                         drops_end = 0
-                    elif not use_r2_threshold or candidate['r2'] >= min_r2_threshold:
-                        # R² decreased but either threshold disabled or still above threshold - accept
+                    elif not left_p['use_r2_threshold']:
+                        # Threshold disabled - accept any valid candidate
+                        best_fit_l = candidate
+                        best_r2_l = candidate['r2']
+                        drops_end += 1
+                    elif candidate['r2'] >= left_p['min_r2_threshold']:
+                        # R² decreased but still above threshold - accept
                         best_fit_l = candidate
                         best_r2_l = candidate['r2']
                         drops_end += 1
                     else:
-                        # R² decreased and below threshold - reject
+                        # R² below threshold - reject but count as drop
                         drops_end += 1
                     
                     # Stop if too many consecutive drops
                     if drops_end >= consecutive_drops:
                         break
+                
+                # # SHRINKING PHASE: Remove noisy endpoints with consecutive-drops logic
+                # # More flexible for noisy data - tolerates R² decreases like expansion phase
+                # # Allow aggressive shrinking - no hard limit, use consecutive drops to control
+                # min_points_for_fit = 30  # Absolute minimum for linear fit
+                # shrink_drops_start = 0
+                # shrink_drops_end = 0
+                
+                # for shrink_iter in range(1000):  # High limit - consecutive drops will stop it
+                #     # Try shrinking from tail end (increase start_idx)
+                #     can_shrink_start = best_fit_l['end'] - (best_fit_l['start'] + 1) >= min_points_for_fit
+                #     can_shrink_end = (best_fit_l['end'] - 1) - best_fit_l['start'] >= min_points_for_fit
+                    
+                #     if not can_shrink_start and not can_shrink_end:
+                #         break  # Can't shrink further
+                    
+                #     # Evaluate both shrink options
+                #     candidate_start = None
+                #     candidate_end = None
+                    
+                #     if can_shrink_start:
+                #         candidate_start = fit_region_left(best_fit_l['start'] + 1, best_fit_l['end'])
+                    
+                #     if can_shrink_end:
+                #         candidate_end = fit_region_left(best_fit_l['start'], best_fit_l['end'] - 1)
+                    
+                #     # Pick best shrink direction (prefer R² improvement)
+                #     best_shrink = None
+                #     shrink_from = None
+                    
+                #     if candidate_start is not None and candidate_end is not None:
+                #         # Both valid - pick better R²
+                #         if candidate_start['r2'] >= candidate_end['r2']:
+                #             best_shrink = candidate_start
+                #             shrink_from = 'start'
+                #         else:
+                #             best_shrink = candidate_end
+                #             shrink_from = 'end'
+                #     elif candidate_start is not None:
+                #         best_shrink = candidate_start
+                #         shrink_from = 'start'
+                #     elif candidate_end is not None:
+                #         best_shrink = candidate_end
+                #         shrink_from = 'end'
+                    
+                #     if best_shrink is None:
+                #         break  # No valid shrink
+                    
+                #     # Apply consecutive-drops logic
+                #     if best_shrink['r2'] >= best_r2_l:
+                #         # R² improved - accept and reset counter
+                #         best_fit_l = best_shrink
+                #         best_r2_l = best_shrink['r2']
+                #         if shrink_from == 'start':
+                #             shrink_drops_start = 0
+                #         else:
+                #             shrink_drops_end = 0
+                #     elif not left_p['use_r2_threshold'] or best_shrink['r2'] >= left_p['min_r2_threshold']:
+                #         # R² decreased but acceptable - allow some drops
+                #         best_fit_l = best_shrink
+                #         best_r2_l = best_shrink['r2']
+                #         if shrink_from == 'start':
+                #             shrink_drops_start += 1
+                #         else:
+                #             shrink_drops_end += 1
+                #     else:
+                #         # R² decreased below threshold
+                #         if shrink_from == 'start':
+                #             shrink_drops_start += 1
+                #         else:
+                #             shrink_drops_end += 1
+                    
+                #     # Stop if too many drops in both directions
+                #     if shrink_drops_start >= left_p['consecutive_drops'] and shrink_drops_end >= left_p['consecutive_drops']:
+                #         break
+                    
+                    
                 
                 # Build final fit dict
                 if best_fit_l is not None:
@@ -3172,17 +3203,23 @@ class DiffusionLengthExtractor:
         right_ln_y = ln_y[intersection_idx:]
         right_deriv = dlnI_dx[intersection_idx:]
         
-        search_limit = max(min_plateau_length + 5, int(len(right_x) * 0.7))
-        right_x_limited = right_x[:search_limit]
-        right_ln_y_limited = right_ln_y[:search_limit]
-        right_deriv_limited = right_deriv[:search_limit]
+        # Optionally limit search range (default) or use full profile
+        if right_p['use_full_right_profile']:
+            right_x_limited = right_x
+            right_ln_y_limited = right_ln_y
+            right_deriv_limited = right_deriv
+        else:
+            search_limit = max(right_p['min_plateau_length'] + 5, int(len(right_x) * 0.8))
+            right_x_limited = right_x[:search_limit]
+            right_ln_y_limited = right_ln_y[:search_limit]
+            right_deriv_limited = right_deriv[:search_limit]
         
         plat_start_r, plat_end_r, mean_deriv_r = self._detect_plateau_in_derivative(
             right_x_limited, right_deriv_limited,
-            min_plateau_length=min_plateau_length,
-            derivative_threshold=derivative_threshold,
-            absolute_threshold=absolute_threshold,
-            search_from_end=False
+            min_plateau_length=right_p['min_plateau_length'],
+            derivative_threshold=right_p['derivative_threshold'],
+            absolute_threshold=right_p['absolute_threshold'],
+            search_from_end=right_p['search_from_end']
         )
         
         if plat_start_r is not None and plat_end_r is not None:
@@ -3203,7 +3240,7 @@ class DiffusionLengthExtractor:
             
             # Helper function to fit a region and return R²
             def fit_region_right(start_idx, end_idx):
-                if end_idx - start_idx < min_plateau_length:
+                if end_idx - start_idx < right_p['min_plateau_length']:
                     return None
                 x_test = x_vals[start_idx:end_idx]
                 ln_y_test = ln_y[start_idx:end_idx]
@@ -3216,13 +3253,17 @@ class DiffusionLengthExtractor:
                     return None
                 
                 try:
+                    # For right side: use local coordinates starting from 0
+                    # Natural slope will be negative for exponential decay, take abs to get positive decay rate
                     x_local = x_test - x_test[0]
                     p = np.polyfit(x_local, ln_y_test, 1)
                     ln_fit = np.polyval(p, x_local)
                     r2 = self._calculate_r2(ln_y_test, ln_fit)
+                    # Both sides should have POSITIVE slope (magnitude of decay rate = 1/λ)
+                    slope = abs(float(p[0]))
                     return {'start': start_idx, 'end': end_idx, 'r2': r2,
                             'x': x_test, 'x_local': x_local, 'ln_y': ln_y_test, 'y': y_test,
-                            'slope': float(p[0]), 'intercept': float(p[1]), 'ln_fit': ln_fit}
+                            'slope': slope, 'intercept': float(p[1]), 'ln_fit': ln_fit}
                 except Exception:
                     return None
             
@@ -3240,7 +3281,7 @@ class DiffusionLengthExtractor:
                 drops_end = 0
                 
                 # Expand toward junction (decrease start_idx) while R² improves
-                for expansion in range(1, max_expansion + 1):
+                for expansion in range(1, right_p['max_expansion'] + 1):
                     new_start = max(intersection_idx, best_fit_r['start'] - expansion)
                     if new_start == best_fit_r['start']:  # Can't expand further
                         break
@@ -3253,21 +3294,26 @@ class DiffusionLengthExtractor:
                         best_fit_r = candidate
                         best_r2_r = candidate['r2']
                         drops_start = 0
-                    elif not use_r2_threshold or candidate['r2'] >= min_r2_threshold:
-                        # R² decreased but either threshold disabled or still above threshold - accept
+                    elif not right_p['use_r2_threshold']:
+                        # Threshold disabled - accept any valid candidate
+                        best_fit_r = candidate
+                        best_r2_r = candidate['r2']
+                        drops_start += 1
+                    elif candidate['r2'] >= right_p['min_r2_threshold']:
+                        # R² decreased but still above threshold - accept
                         best_fit_r = candidate
                         best_r2_r = candidate['r2']
                         drops_start += 1
                     else:
-                        # R² decreased and below threshold - reject
+                        # R² below threshold - reject but count as drop
                         drops_start += 1
                     
                     # Stop if too many consecutive drops
-                    if drops_start >= consecutive_drops:
+                    if drops_start >= right_p['consecutive_drops']:
                         break
                 
                 # Expand toward tail (increase end_idx) while R² improves
-                for expansion in range(1, max_expansion + 1):
+                for expansion in range(1, right_p['max_expansion'] + 1):
                     new_end = min(len(x_vals), best_fit_r['end'] + expansion)
                     if new_end == best_fit_r['end']:  # Can't expand further
                         break
@@ -3280,18 +3326,106 @@ class DiffusionLengthExtractor:
                         best_fit_r = candidate
                         best_r2_r = candidate['r2']
                         drops_end = 0
-                    elif not use_r2_threshold or candidate['r2'] >= min_r2_threshold:
-                        # R² decreased but either threshold disabled or still above threshold - accept
+                    elif not right_p['use_r2_threshold']:
+                        # Threshold disabled - accept any valid candidate
+                        best_fit_r = candidate
+                        best_r2_r = candidate['r2']
+                        drops_end += 1
+                    elif candidate['r2'] >= right_p['min_r2_threshold']:
+                        # R² decreased but still above threshold - accept
                         best_fit_r = candidate
                         best_r2_r = candidate['r2']
                         drops_end += 1
                     else:
-                        # R² decreased and below threshold - reject
+                        # R² below threshold - reject but count as drop
                         drops_end += 1
                     
                     # Stop if too many consecutive drops
                     if drops_end >= consecutive_drops:
                         break
+                
+                # # SHRINKING PHASE: Remove noisy endpoints with consecutive-drops logic
+                # # More flexible for noisy data - tolerates R² decreases like expansion phase
+                # # Allow aggressive shrinking - no hard limit, use consecutive drops to control
+                # min_points_for_fit = 3  # Absolute minimum for linear fit
+                # shrink_drops_start = 0
+                # shrink_drops_end = 0
+                
+                # for shrink_iter in range(1000):  # High limit - consecutive drops will stop it
+                #     # Try shrinking from both ends
+                #     can_shrink_start = best_fit_r['end'] - (best_fit_r['start'] + 1) >= min_points_for_fit
+                #     can_shrink_end = (best_fit_r['end'] - 1) - best_fit_r['start'] >= min_points_for_fit
+                    
+                #     if not can_shrink_start and not can_shrink_end:
+                #         break  # Can't shrink further
+                    
+                #     # Evaluate both shrink options
+                #     candidate_start = None
+                #     candidate_end = None
+                    
+                #     if can_shrink_start:
+                #         candidate_start = fit_region_right(best_fit_r['start'] + 1, best_fit_r['end'])
+                    
+                #     if can_shrink_end:
+                #         candidate_end = fit_region_right(best_fit_r['start'], best_fit_r['end'] - 1)
+                    
+                #     # Pick best shrink direction (prefer R² improvement)
+                #     best_shrink = None
+                #     shrink_from = None
+                    
+                #     if candidate_start is not None and candidate_end is not None:
+                #         # Both valid - pick better R²
+                #         if candidate_start['r2'] >= candidate_end['r2']:
+                #             best_shrink = candidate_start
+                #             shrink_from = 'start'
+                #         else:
+                #             best_shrink = candidate_end
+                #             shrink_from = 'end'
+                #     elif candidate_start is not None:
+                #         best_shrink = candidate_start
+                #         shrink_from = 'start'
+                #     elif candidate_end is not None:
+                #         best_shrink = candidate_end
+                #         shrink_from = 'end'
+                    
+                #     if best_shrink is None:
+                #         break  # No valid shrink
+                    
+                #     # Apply consecutive-drops logic
+                #     if best_shrink['r2'] >= best_r2_r:
+                #         # R² improved - accept and reset counter
+                #         best_fit_r = best_shrink
+                #         best_r2_r = best_shrink['r2']
+                #         if shrink_from == 'start':
+                #             shrink_drops_start = 0
+                #         else:
+                #             shrink_drops_end = 0
+                #     elif not right_p['use_r2_threshold']:
+                #         # Threshold disabled - accept any valid candidate
+                #         best_fit_r = best_shrink
+                #         best_r2_r = best_shrink['r2']
+                #         if shrink_from == 'start':
+                #             shrink_drops_start += 1
+                #         else:
+                #             shrink_drops_end += 1
+                #     elif best_shrink['r2'] >= right_p['min_r2_threshold']:
+                #         # R² decreased but still above threshold - accept
+                #         best_fit_r = best_shrink
+                #         best_r2_r = best_shrink['r2']
+                #         if shrink_from == 'start':
+                #             shrink_drops_start += 1
+                #         else:
+                #             shrink_drops_end += 1
+                #     else:
+                #         # R² below threshold - reject but count as drop
+                #         if shrink_from == 'start':
+                #             shrink_drops_start += 1
+                #         else:
+                #             shrink_drops_end += 1
+                    
+                #     # Stop if too many drops in both directions
+                #     if shrink_drops_start >= right_p['consecutive_drops'] and shrink_drops_end >= right_p['consecutive_drops']:
+                #         break
                 
                 # Build final fit dict
                 if best_fit_r is not None:
@@ -3374,12 +3508,13 @@ class DiffusionLengthExtractor:
 
         return results
 
-    def fit_all_profiles_linear(self, use_plateau_detection=True, use_shifting=False,
+    def fit_all_profiles_linear(self, use_plateau_detection=True, use_shifting=True,
                                  gradient_window=9, min_plateau_length=5,
                                  derivative_threshold=0.3, absolute_threshold=0.03,
                                  max_expansion=30, consecutive_drops=3, min_r2_threshold=0.80,
-                                 use_r2_threshold=True, junction_precision=True,
-                                 use_filtered_data=False, filter_cutoff=0.0):
+                                 use_r2_threshold=True, junction_precision=True, use_full_right_profile=False,
+                                 use_filtered_data=False, filter_cutoff=0.0,
+                                 left_params=None, right_params=None):
         """
         Run linear-on-log fitting for all loaded profiles and populate self.results
         similarly to fit_all_profiles.
@@ -3417,6 +3552,10 @@ class DiffusionLengthExtractor:
             If True, apply low-pass filter to current data before fitting (default: False)
         filter_cutoff : float
             Cutoff fraction for low-pass filter (default: 0.1 = 10% of Nyquist frequency)
+        left_params : dict, optional
+            Override parameters for left side fitting
+        right_params : dict, optional
+            Override parameters for right side fitting
         """
         self.results = []
         self.inv_lambdas = []
@@ -3455,7 +3594,10 @@ class DiffusionLengthExtractor:
                     consecutive_drops=consecutive_drops,
                     min_r2_threshold=min_r2_threshold,
                     use_r2_threshold=use_r2_threshold,
-                    junction_precision=junction_precision
+                    junction_precision=junction_precision,
+                    use_full_right_profile=use_full_right_profile,
+                    left_params=left_params,
+                    right_params=right_params
                 )
             elif use_plateau_detection:
                 # NEW: Use derivative plateau detection only

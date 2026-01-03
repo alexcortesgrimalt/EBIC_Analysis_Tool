@@ -1233,9 +1233,9 @@ class SEMViewer:
 
                 sem_vals_norm = (sem_vals - np.min(sem_vals)) / (np.ptp(sem_vals) + 1e-12)
 
-                # Create a 3-row stacked figure: SEM+current, log-current, derivative
-                fig, (ax1, ax_log, ax_deriv) = plt.subplots(
-                    3, 1, sharex=True, figsize=(6, 7), gridspec_kw={'height_ratios': [1, 1, 0.8]}
+                # Create a 2-row stacked figure: SEM+current, log-current
+                fig, (ax1, ax_log) = plt.subplots(
+                    2, 1, sharex=True, figsize=(6, 6)
                 )
 
                 ax1.plot(dist_um, sem_vals_norm, color='tab:blue', linewidth=2, label='SEM (norm)')
@@ -1267,23 +1267,10 @@ class SEMViewer:
                 cur_safe = np.maximum(cur, floor)
                 ax_log.plot(dist_um, cur_safe, color='tab:orange', linewidth=1.5, label='Current (nA)')
                 ax_log.set_yscale('log')
-
-                # Bottom: numeric derivative dI/dx
-                try:
-                    deriv = np.gradient(cur, dist_um)
-                    ax_deriv.plot(dist_um, deriv, color='tab:green', linewidth=1.2, label='dI/dx')
-                    ax_deriv.fill_between(dist_um, deriv, 0, where=(deriv >= 0), interpolate=True, color='tab:green', alpha=0.25)
-                    ax_deriv.fill_between(dist_um, deriv, 0, where=(deriv < 0), interpolate=True, color='tab:red', alpha=0.12)
-                    if prof.get("intersection_idx") is not None:
-                        try:
-                            ax_deriv.scatter(dist_um[idx], deriv[idx], color='lime', s=40, marker='x', zorder=10)
-                        except Exception:
-                            pass
-                    ax_deriv.set_ylabel('dI/dx (nA/µm)')
-                    ax_deriv.grid(True, linestyle='--', alpha=0.3)
-                    ax_deriv.legend(loc='upper left')
-                except Exception:
-                    ax_deriv.text(0.5, 0.5, 'dI/dx unavailable', ha='center', va='center')
+                ax_log.set_xlabel('Distance (µm)')
+                ax_log.set_ylabel('Current (nA) [log]')
+                ax_log.legend(loc='upper left')
+                ax_log.grid(True, linestyle='--', alpha=0.3)
 
                 fig.tight_layout()
 
@@ -1520,18 +1507,27 @@ class SEMViewer:
                 half_width_px = int(np.round(width_um * 1e-6 / self.pixel_size))
                 half_width_px = max(1, half_width_px)
 
-            # Ask perpendicular params (num lines and length)
+            # Ask perpendicular params (num lines and lengths for each side)
             from tkinter import Tk, simpledialog
             root = Tk(); root.withdraw(); root.update()
             try:
                 num_lines = simpledialog.askinteger("Input", "Number of perpendicular lines:", parent=root, minvalue=1, maxvalue=200)
-                length_um = simpledialog.askfloat("Input", "Length of each perpendicular line (µm):", parent=root, minvalue=0.1, maxvalue=1e5)
+                if num_lines is None:
+                    root.destroy()
+                    print("Operation canceled by user.")
+                    return
+                length_left_um = simpledialog.askfloat("Input", "Length on LEFT side of line (µm):", parent=root, minvalue=0.1, maxvalue=1e5)
+                if length_left_um is None:
+                    root.destroy()
+                    print("Operation canceled by user.")
+                    return
+                length_right_um = simpledialog.askfloat("Input", "Length on RIGHT side of line (µm):", parent=root, minvalue=0.1, maxvalue=1e5)
             except Exception:
                 root.destroy()
                 print("Invalid input. Operation canceled.")
                 return
             root.destroy()
-            if num_lines is None or length_um is None:
+            if num_lines is None or length_left_um is None or length_right_um is None:
                 print("Operation canceled by user.")
                 return
 
@@ -1582,7 +1578,7 @@ class SEMViewer:
                         detected_list[i] = np.asarray(detected_coords)
                         # Compute perpendicular profiles using detected junction as intersection reference
                         try:
-                            profiles = calculate_perpendicular_profiles(mapped_dense, int(num_lines), float(length_um), sem_data, cm_list[1] if (cm_list and len(cm_list) > 1) else None, pixel_size_m=ds.get('pixel_size', self.pixel_size), detected_junction=detected_coords, source_name=ds.get('sample_name'))
+                            profiles = calculate_perpendicular_profiles(mapped_dense, int(num_lines), float(length_left_um + length_right_um), sem_data, cm_list[1] if (cm_list and len(cm_list) > 1) else None, pixel_size_m=ds.get('pixel_size', self.pixel_size), detected_junction=detected_coords, source_name=ds.get('sample_name'), length_left_um=float(length_left_um), length_right_um=float(length_right_um))
                             perp_list[i] = profiles
                         except Exception as e:
                             pass  # print(f"Failed to compute perpendiculars for dataset {i}: {e}")

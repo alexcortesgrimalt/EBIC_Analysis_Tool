@@ -43,11 +43,8 @@ class JunctionAnalyzer:
                 # Do not fail detection if plotting is unavailable
                 pass
 
-        # If user requested a weight sweep and we're not already inside a sweep, invoke it.
-        # Use _sweep_call to avoid recursive re-entry (visualize_weight_sweep calls detect()).
         if sweep_weights is not None and not _sweep_call and debug:
             try:
-                # Show the sweep (per-weight debug popups) and continue with normal detection.
                 self.visualize_weight_sweep(roi, manual_line, roi_current=roi_current, weights=tuple(sweep_weights), per_weight_debug=True, show=True)
             except Exception:
                 pass
@@ -57,13 +54,11 @@ class JunctionAnalyzer:
         # --- Method : Canny with Bilateral pre-filtering, with post-processing ---
         try:
             filtered_roi = self._apply_preprocessing_filter(roi)
-            # If an EBIC/current ROI is provided, preprocess it similarly
             filtered_current = None
             if roi_current is not None:
                 try:
                     filtered_current = self._apply_preprocessing_filter(roi_current)
                 except Exception:
-                    # If preprocessing fails, fall back to raw current ROI
                     filtered_current = roi_current.astype(np.uint8)
 
             detected_roi_coords = self._detect_junction_canny(filtered_roi, roi_current=filtered_current, weight_current=weight_current, debug=debug)
@@ -87,16 +82,29 @@ class JunctionAnalyzer:
                     import matplotlib.pyplot as plt
 
                     # Show filtered ROI with overlays
-                    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+                    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
                     ax.imshow(filtered_roi, cmap='gray', origin='upper')
-                    # detected_roi_coords are (col, row) in ROI coords
-                    ax.plot(detected_roi_coords[:, 0], detected_roi_coords[:, 1], 'y.', markersize=2, label='detected (ROI)')
-                    # postprocessed_roi_coords may be dense (spline)
-                    ax.plot(postprocessed_roi_coords[:, 0], postprocessed_roi_coords[:, 1], 'c-', linewidth=1, label='postproc spline')
-                    # mapped image coords are in image coordinates (x,y)
-                    ax.plot(detected_image_coords[:, 0], detected_image_coords[:, 1], 'r-', linewidth=1, label='mapped detected')
-                    # manual_line_rs is in image coords already (resampled manual line)
-                    ax.plot(manual_line_rs[:, 0], manual_line_rs[:, 1], 'g--', linewidth=1, label='manual line')
+                    
+                    # Manual line should be at the center of ROI (row = H/2) since ROI is extracted perpendicular to it
+                    manual_roi_y = (h - 1) / 2.0
+                    ax.axhline(y=manual_roi_y, color='green', linestyle='--', linewidth=1.5, label='manual line center', alpha=0.7)
+                    
+                    # If EBIC is available, show separate SEM-only and EBIC-only predictions
+                    if filtered_current is not None:
+                        # SEM-only detection (weight=0)
+                        detected_sem_only = self._detect_junction_canny(filtered_roi, roi_current=filtered_current, weight_current=0.0, debug=False)
+                        postproc_sem = self._fit_line_postprocessing(detected_sem_only)
+                        ax.plot(postproc_sem[:, 0], postproc_sem[:, 1], 'b-', linewidth=1.5, label='SEM only (w=0)', alpha=0.8)
+                        
+                        # EBIC-only detection (very high weight)
+                        detected_ebic_only = self._detect_junction_canny(filtered_roi, roi_current=filtered_current, weight_current=1e6, debug=False)
+                        postproc_ebic = self._fit_line_postprocessing(detected_ebic_only)
+                        ax.plot(postproc_ebic[:, 0], postproc_ebic[:, 1], 'orange', linewidth=1.5, label='EBIC only (w=1e6)', alpha=0.8)
+                    
+                    # Combined detection (current weight)
+                    ax.plot(detected_roi_coords[:, 0], detected_roi_coords[:, 1], 'y.', markersize=3, label=f'combined raw (w={weight_current})', alpha=0.6)
+                    ax.plot(postprocessed_roi_coords[:, 0], postprocessed_roi_coords[:, 1], 'r-', linewidth=2, label=f'combined fit (w={weight_current})')
+                    
                     # Overlay SEM Canny edges (compute with Otsu on the filtered ROI)
                     try:
                         roi8 = filtered_roi if filtered_roi.dtype == np.uint8 else cv2.normalize(filtered_roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -104,11 +112,23 @@ class JunctionAnalyzer:
                         edges_sem = cv2.Canny(roi8, 0.5 * float(otsu_r), float(otsu_r))
                         ys_sem, xs_sem = np.where(edges_sem > 0)
                         if ys_sem.size > 0:
-                            ax.scatter(xs_sem, ys_sem, s=1, c='magenta', label='SEM Canny')
+                            ax.scatter(xs_sem, ys_sem, s=1, c='magenta', label='SEM Canny', alpha=0.3)
                     except Exception:
                         pass
+                    
+                    # Overlay EBIC Canny edges if available
+                    if filtered_current is not None:
+                        try:
+                            roi_curr8 = filtered_current if filtered_current.dtype == np.uint8 else cv2.normalize(filtered_current, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                            otsu_c, _ = cv2.threshold(roi_curr8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                            edges_curr = cv2.Canny(roi_curr8, 0.5 * float(otsu_c), float(otsu_c))
+                            ys_c, xs_c = np.where(edges_curr > 0)
+                            if ys_c.size > 0:
+                                ax.scatter(xs_c, ys_c, s=1, c='cyan', label='EBIC Canny', alpha=0.4)
+                        except Exception:
+                            pass
 
-                    ax.set_title('Filtered ROI with detected points and post-processed line')
+                    ax.set_title(f'Junction Detection Comparison (EBIC weight={weight_current})')
                     ax.legend(loc='best', fontsize='small')
                     plt.tight_layout()
                     plt.show()
